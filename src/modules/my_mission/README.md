@@ -40,11 +40,16 @@ WAIT ──手势解锁 + 进 Offboard──> TAKEOFF ──到达 MYM_ALT──
   这一步是让 commander 认为 "Offboard 可用"，**必须在切进 Offboard 之前就开始发**。
   进 `TAKEOFF` 时把当前航向锁进 `_takeoff_yaw`，后面 `FORWARD` 用它算"前方"。
 - `TAKEOFF`：目标 = 进入点上方 `MYM_ALT`，NED 里就是 `z = 进入时 z - MYM_ALT`（向上为负）。
-- `FORWARD`：目标 = **起飞点** 沿 `_takeoff_yaw + MYM_FWD_DIR` 前方 `MYM_FWD_DIST` 米，高度不变。
+- `FORWARD`：终点 = **起飞点** 沿 `_takeoff_yaw + MYM_FWD_DIR` 前方 `MYM_FWD_DIST` 米，高度不变。
     - 机头单位向量在 NED 里是 `(cos ψ, sin ψ)`：ψ 的定义是"从北起顺时针为正"，
       而 NED 的 x 指北、y 指东，x→y 也是顺时针 —— **两个角度系统重合，不用转负号**。
     - 起点固定用起飞点（不是"当前位置"），所以同一个场地跑几次都落在同一点。
     - yaw 保持锁存值，飞机是**机头朝前平飞**过去，不是侧着飘过去。
+    - **位置目标不是一步跳到终点的**：`TAKEOFF` 只把终点存进 `_fwd_goal`，
+      `FORWARD` 每拍把发出去的 `_target` 朝它推 `MYM_FWD_SPD × dt`，
+      由 `MYM_FWD_ACC` 限出"加速 → 匀速 → 减速"梯形曲线，同时把该速度作为
+      `velocity[0..1]` 前馈一起发。详见下面 [为什么不能跳](#为什么位置目标不能一步跳过去)。
+    - 到位判据 = 斜坡走完（`_target` 已等于终点）**且**实际速度 < 0.3 m/s。
     - 超时 `MYM_FWD_TMO` → 直接转 `LAND`（和起飞超时同样的策略：不硬追）。
 - `HOVER`：保持同一 setpoint `MYM_HOVER` 秒。
 - `LAND`：`MYM_LAND_MODE=1` 发 `MAV_CMD_NAV_LAND` 交给 PX4 AUTO_LAND；`=0` 则纯 Offboard 把 z 以
@@ -63,7 +68,9 @@ WAIT ──手势解锁 + 进 Offboard──> TAKEOFF ──到达 MYM_ALT──
 | `MYM_ALT` | 1.0 m | 起飞目标高度 |
 | `MYM_FWD_DIST` | 3.0 m | 到高度后沿机头方向再平飞多远。**0 = 跳过 FORWARD** |
 | `MYM_FWD_DIR` | 0.0 deg | 前飞方向相对起飞航向的偏角：0 = 正前，+90 = 右，-90 = 左，180 = 后 |
-| `MYM_FWD_TMO` | 20 s | 前飞超时 → 直接转降落 |
+| `MYM_FWD_SPD` | 1.0 m/s | 前飞巡航速度（对地）。位置目标是按这个速度**推**过去的，不是一步跳过去 |
+| `MYM_FWD_ACC` | 1.0 m/s² | 前飞加/减速上限。**决定姿态变化大小**：平飞倾角 ≈ `atan(加速度/9.81)`，1.0 → ≈6° |
+| `MYM_FWD_TMO` | 20 s | 前飞超时 → 直接转降落。斜坡比阶跃慢，改小 `MYM_FWD_SPD` 时要一起放大 |
 | `MYM_HOVER` | 5.0 s | 到达目标点后的悬停时间 |
 | `MYM_LAND_MODE` | 1 | 0 = Offboard 下降，1 = PX4 AUTO_LAND |
 | `MYM_DESC_RATE` | 0.4 m/s | Offboard 下降速率（仅 mode 0）。**会被强制抬到 ≥ `1.1 × LNDMC_Z_VEL_MAX`（0.275 m/s）**，否则 land detector 判不出"被指令下降"，`landed` 永远上不去 → 上不了锁 |
@@ -239,6 +246,83 @@ listener trajectory_setpoint
 
 跑完之后：模块停在 `WAIT`，再切一次 Offboard + 解锁就会重跑一遍。
 想彻底停掉：`my_mission stop`。
+
+> 只用 SIH（不需要 Gazebo、秒级起停）时改成 `PX4_SIM_MODEL=sihsim_quadx`，
+> 起来后手动 `my_mission start`（SIH 的 airframe 不会自启本模块）。
+
+## 为什么位置目标不能一步跳过去
+
+**这条也踩过坑。** 最早的 `FORWARD` 是这么写的：
+
+```cpp
+_target(0) += fwd_dist * cosf(psi);   // ← 给位置环一个 fwd_dist 米的阶跃
+_target(1) += fwd_dist * sinf(psi);
+```
+
+现象：切进 `FORWARD` 的瞬间飞机猛地往前冲、姿态一下压到底。
+
+原因全在 PX4 的位置环是**没有加速度限制的 P 环**（`PositionControl.cpp:130-140`）：
+
+```
+vel_sp = (_pos_sp - _pos) * MPC_XY_P          // 默认 0.95 m/s per m
+vel_sp.xy() = constrainXY(..., MPC_XY_VEL_MAX) // 默认 12 m/s，只是天花板
+acc_sp = (vel_sp - _vel) * MPC_XY_VEL_P_ACC    // 默认 1.8 m/s² per m/s
+```
+
+| `MYM_FWD_DIST` | 阶跃后 `vel_sp` | `acc_sp` | 倾角 `atan(a/g)` |
+|---|---|---|---|
+| 1 m | 0.95 m/s | 1.7 m/s² | 10° |
+| 3 m | 2.85 m/s | 5.1 m/s² | 28° |
+| 10 m | 9.5 m/s | 17.1 m/s² | 60° → 被 `MPC_TILTMAX_AIR`(45°) 削平 |
+| ≥ 12.6 m | 顶到 12 m/s | — | 全程 45° |
+
+⚠ **参数救不了这个**：
+- `MPC_ACC_HOR` 只喂给 `GotoControl`（`MulticopterPositionControl.cpp:199`）；
+  一旦外部在发 `trajectory_setpoint`，`GotoControl` 被整个跳过
+  （同文件 `427-435`，`goto_setpoint_enable` 要求 `!_trajectory_setpoint_sub.updated()`）。
+  所以 Offboard 的位置阶跃**没有任何加速度限制**。
+- 调小 `MPC_XY_P` 确实能减小爆发速度，但它同时把悬停刚度、抗风、自动模式的位置响应
+  一起拉低，是"全局副作用换局部效果"。
+
+**正确做法**：别让 setpoint 跳，让它自己以指定速度飞过去 ——
+`_target` 每拍朝终点推 `v·dt`，`v` 由梯形曲线给出（`MYM_FWD_SPD` 限速、
+`MYM_FWD_ACC` 限加减速），并把它作为 `velocity[0..1]` 前馈一起发。
+
+前馈为什么关键：位置环是 `vel_sp = 速度前馈 + MPC_XY_P × 位置误差`（两者相加），
+前馈给成"setpoint 正在移动的速度"之后位置误差 ≈ 0，飞机精确跟着 setpoint 走 ——
+**既不会滞后，也不会在停的时候冲过去**。倾角只需要 `atan(v̇/g)`，
+1.0 m/s² 对应约 6°，看起来就是平稳平飞。
+
+副作用：斜坡比阶跃慢，`MYM_FWD_SPD` 给小了之后原来的 `MYM_FWD_TMO` 可能不够用。
+进 `FORWARD` 时会按曲线估算一遍总时间，超过就 `PX4_WARN` 提醒。
+
+## 跟踪监控：目标点离飞机多远（只看，不管）
+
+斜坡是**开环**推进的：只按速度曲线走，完全不看飞机跟没跟上。到底跟得怎么样，
+先**测出来**，再决定要不要加限制。
+
+FORWARD 期间每 0.5 秒打一行（`kTrackLogInterval`）：
+
+```
+my_mission: track |d|=0.42 m (along 0.38, cross 0.17)  sp 1.00 m/s  v 0.98 m/s
+```
+
+三个量分开看，因为它们对控制的含义完全不同：
+
+| 量 | 含义 | 谁来消掉它 |
+|---|---|---|
+| `\|d\|` | 两点间的 **2D 距离** | 位置环 P 项 + 斜坡自己推进 |
+| `along` | 在**前进方向**上的投影 | 前进自己就能消掉（正常应该很小） |
+| `cross` | **垂直**于前进方向的分量 | **只能靠位置环纠，往前飞多少米都不会变小** |
+
+**为什么要拆开**：`cross` 偏大说明飞机在往旁边飘（航向估计歪 / 侧风），
+这时候压前进速度毫无用处——侧向偏差靠前进永远消不掉。
+实测 SIH 里出现过 `along 0.05 m` 但 `cross 0.90 m`，2D 口径看着像"差很远"，
+实际纵向几乎贴着，纯粹是侧滑。
+
+> 试过用 2D 距离做领先限幅（目标点领先太多就压速度），结果被侧滑**永久锁死**
+> （33 秒只走 2.65 m，最后电池放完触发 failsafe）。所以现在只监控、不加限幅。
+
 
 ## ⚠ 冲突 1：`trajectory_setpoint` 不能在非 Offboard 时发
 

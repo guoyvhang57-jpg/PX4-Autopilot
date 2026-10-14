@@ -92,8 +92,14 @@
  *        ──MYM_HOVER 秒──> LAND ──> DISARM ──> DONE ──(已上锁)──> WAIT（可以再跑一遍）
  *
  *   FORWARD 只在 MYM_FWD_DIST > 0 时插入（= 0 时行为跟以前完全一样）。
- *   目标点 = **起飞点** 沿"起飞那一刻锁定的机头方向"前方 MYM_FWD_DIST 米，
+ *   终点 = **起飞点** 沿"起飞那一刻锁定的机头方向"前方 MYM_FWD_DIST 米，
  *   MYM_FWD_DIR 再叠一个相对偏角（0 = 正前方，+90 = 右侧）。见 Run() 的 TAKEOFF 分支。
+ *
+ *   ⚠ 位置目标**不是**一步跳到终点的：TAKEOFF 只把终点记进 _fwd_goal，
+ *     FORWARD 状态每拍把 _target 朝它推 MYM_FWD_SPD * dt（MYM_FWD_ACC 限加减速，
+ *     走"加速-匀速-减速"梯形曲线），同时把该速度作为 velocity 前馈发出去。
+ *     一步跳过去的话，位置环会瞬间要求 (跳跃距离 * MPC_XY_P) 那么大的速度，
+ *     姿态猛压甚至顶到倾角上限 —— 这个坑见 FORWARD case 开头的长注释。
  *
  *   ⚠ "正前方"完全由**航向估计**决定（GPS 双天线 / 磁罗盘 / EKF）。航向歪多少度，
  *     飞出去的方向就歪多少度，而且 MYM_FWD_DIST 越大偏得越远（3 m 上偏 30° = 1.5 m）。
@@ -141,10 +147,20 @@
 
 #include <mathlib/mathlib.h>
 
+#include <lib/geo/geo.h>   // CONSTANTS_ONE_G：算"加速度对应多大倾角"用
+
 #include <px4_platform_common/events.h>
 #include <px4_platform_common/getopt.h>
 #include <px4_platform_common/log.h>
 #include <px4_platform_common/posix.h>
+
+// ===========================================================================
+// kTrackLogInterval：FORWARD 期间"目标点 vs 飞机实际位置"打点的间隔
+// ===========================================================================
+// 现在**只监控、不做任何控制动作**：斜坡照样按曲线推进、前馈照样照发，
+// 只是每 0.5 秒把"目标点离飞机多远"打一行出来，用来观察跟踪质量。
+// 等看清了实际会有多大滞后 / 多少侧向偏差，再决定要不要加限幅。
+static constexpr hrt_abstime kTrackLogInterval{500_ms};
 
 ModuleBase::Descriptor MyMission::desc{task_spawn, custom_command, print_usage};
 
@@ -252,7 +268,7 @@ void MyMission::publishOffboardControlMode(hrt_abstime now)
 	_ocm_pub.publish(ocm);
 }
 
-void MyMission::publishTrajectorySetpoint(hrt_abstime now, float z_velocity)
+void MyMission::publishTrajectorySetpoint(hrt_abstime now, float z_velocity, const matrix::Vector2f &xy_velocity)
 {
 	// ===================================================================
 	// 只在真正处于 Offboard 时才发 —— 这不是优化，是正确性要求
@@ -303,6 +319,19 @@ void MyMission::publishTrajectorySetpoint(hrt_abstime now, float z_velocity)
 		tsp.velocity[i] = NAN;
 		tsp.acceleration[i] = NAN;
 		tsp.jerk[i] = NAN;
+	}
+
+	// ---- 可选的水平速度前馈（只有 FORWARD 的斜坡用）----
+	// 位置环的结构是 vel_sp = 速度前馈 + MPC_XY_P * 位置误差（两者相加），
+	// 前馈给成"setpoint 当前正在移动的速度"，位置误差就≈0，飞机精确跟着
+	// setpoint 走：既不会因为追不上而滞后，也不会在停的时候冲过去。
+	//
+	// 只写 velocity[0] / velocity[1]，**不碰 velocity[2]** —— land detector 的
+	// _in_descend 只读 velocity[2]（MulticopterLandDetector.cpp:248），
+	// 所以给水平前馈不会像"位置-only 的 NaN 速度"那样把着陆检测搞坏。
+	if (PX4_ISFINITE(xy_velocity(0)) && PX4_ISFINITE(xy_velocity(1))) {
+		tsp.velocity[0] = xy_velocity(0);
+		tsp.velocity[1] = xy_velocity(1);
 	}
 
 	// ---- 可选的 z 速度前馈 ----
@@ -573,15 +602,40 @@ void MyMission::Run()
 
 				// 起点用 _target(0)/(1)：TAKEOFF 全程没动过它们，还是 WAIT 里钉下的
 				// 起飞点。这样"飞到哪个点"相对起飞点固定，同一个场地跑几次都落在同一处。
-				_target(0) += fwd_dist * cosf(psi);
-				_target(1) += fwd_dist * sinf(psi);
+				//
+				// 【关键】这里只把**终点**存进 _fwd_goal，**_target 一个数都不改**。
+				// 以前是直接 _target += fwd_dist*dir，那是给位置环一个阶跃，
+				// 位置环下一拍就会要 (阶跃 x MPC_XY_P) 那么大的速度、姿态猛压。
+				// 现在 _target 留在起飞点，由 FORWARD 状态每拍推一点点过去。
+				_fwd_goal(0) = _target(0) + fwd_dist * cosf(psi);
+				_fwd_goal(1) = _target(1) + fwd_dist * sinf(psi);
 
 				// z 不动：先在 MYM_ALT 上平飞过去，到了再降。
 				_state = State::Forward;
 				_state_start = now;
+				_ramp_speed = 0.f;   // 斜坡从 0 速起步
+
+				// 按 MYM_FWD_SPD / MYM_FWD_ACC 估算这条梯形曲线要走多久，
+				// 和 MYM_FWD_TMO 对一下 —— 斜坡比阶跃慢得多，超时参数不跟着改会
+				// 变成"还没飞到就被判超时去降落"。
+				const float spd = math::max(_param_mym_fwd_spd.get(), 0.01f);
+				const float acc = math::max(_param_mym_fwd_acc.get(), 0.05f);
+				const float d_ramp = spd * spd / acc;   // 加速段 + 减速段一共走的距离
+				const float t_est = (fwd_dist > d_ramp)
+						    ? (2.f * spd / acc + (fwd_dist - d_ramp) / spd)
+						    : (2.f * sqrtf(fwd_dist / acc));
+
 				PX4_INFO("my_mission: FORWARD %.2f m at %.0f deg (heading %.0f deg) -> target [%.2f %.2f]",
 					 (double)fwd_dist, (double)_param_mym_fwd_dir.get(),
-					 (double)math::degrees(_takeoff_yaw), (double)_target(0), (double)_target(1));
+					 (double)math::degrees(_takeoff_yaw), (double)_fwd_goal(0), (double)_fwd_goal(1));
+				PX4_INFO("my_mission: ramp %.2f m/s acc %.2f m/s^2, est %.1f s (tilt ~%.0f deg)",
+					 (double)spd, (double)acc, (double)t_est,
+					 (double)math::degrees(atanf(acc / CONSTANTS_ONE_G)));
+
+				if (t_est > _param_mym_fwd_tmo.get()) {
+					PX4_WARN("my_mission: est %.1f s > MYM_FWD_TMO %.1f s -> will time out; "
+						 "raise MYM_FWD_TMO or MYM_FWD_SPD", (double)t_est, (double)_param_mym_fwd_tmo.get());
+				}
 
 			} else {
 				// MYM_FWD_DIST = 0：跳过 FORWARD，行为跟没有这个功能时完全一样。
@@ -601,28 +655,95 @@ void MyMission::Run()
 
 		break;
 
-	case State::Forward:
-		// 目标在 TAKEOFF 分支里算好了，这里每拍照发（不发就是 offboard signal lost）。
-		// 注意 yaw 保持锁存值不动 —— setpoint 里给了 yaw，位置环会用它当机头指向，
-		// 于是飞机是"机头朝前平飞过去"，而不是侧着飘过去。
-		publishTrajectorySetpoint(now);
+	case State::Forward: {
 
-		if (reachedTarget(pos)) {
-			_state = State::Hover;
-			_state_start = now;
-			PX4_INFO("my_mission: reached forward point [%.2f %.2f], HOVER %.1f s",
-				 (double)_target(0), (double)_target(1), (double)_param_mym_hover.get());
+			const float spd = math::max(_param_mym_fwd_spd.get(), 0.01f);
+			const float acc = math::max(_param_mym_fwd_acc.get(), 0.05f);
 
-		} else if (elapsedSince(_state_start, now) > _param_mym_fwd_tmo.get()) {
-			// 飞不到（航向估计歪 / 顶风 / EKF 位置漂 / MYM_ARRIVE 太小）→ 不再硬追，
-			// 和起飞超时同样的策略：直接进降落流程，别一直在外面飞。
-			PX4_WARN("my_mission: forward timeout, going to LAND");
-			_state = State::Land;
-			_state_start = now;
-			_land_cmd_sent = false;
+			const float dx = _fwd_goal(0) - _target(0);
+			const float dy = _fwd_goal(1) - _target(1);
+			const float dist = sqrtf(dx * dx + dy * dy);
+
+			// 前进方向单位向量（_target → 终点）。dist 可能是 0，先挡住再除。
+			const float ux_dir = (dist > 1e-3f) ? (dx / dist) : 0.f;
+			const float uy_dir = (dist > 1e-3f) ? (dy / dist) : 0.f;
+
+			// ===================================================================
+			float setpoint_speed = math::min(spd, _ramp_speed + acc * dt);
+			setpoint_speed = math::min(setpoint_speed, sqrtf(2.f * acc * dist));
+			_ramp_speed = setpoint_speed;   // 状态：供下一拍的加速限幅用
+
+			matrix::Vector2f ff_velocity{NAN, NAN};   // 前馈速度矢量（NED 北/东），发出去的就是它
+			bool sp_at_goal = false;   // 这一拍 setpoint 是否已经贴在终点上
+
+			if (dist < 1e-3f) {
+				// 已经贴住终点：setpoint 不动，前馈给 0（明确的"要求停住"）
+				_target(0) = _fwd_goal(0);
+				_target(1) = _fwd_goal(1);
+				_ramp_speed = 0.f;
+				ff_velocity(0) = 0.f;
+				ff_velocity(1) = 0.f;
+				sp_at_goal = true;
+
+			} else if (dist <= setpoint_speed * dt) {
+				// 这一拍就能走到头。前馈必须按**实际位移/dt** 算，不能按 setpoint_speed ——
+				// 否则 setpoint 只挪了一点点，却让飞机按满速飞，最后一拍就冲过头了。
+				ff_velocity(0) = dx / dt;
+				ff_velocity(1) = dy / dt;
+				_target(0) = _fwd_goal(0);
+				_target(1) = _fwd_goal(1);
+				_ramp_speed = 0.f;
+				sp_at_goal = true;
+
+			} else {
+				// 前馈速度矢量：方向 = 目标点前进方向，大小 = setpoint_speed。
+				// 然后 _target 就按**同一个速度**往前一步 —— 所以发出去的 velocity 严格
+				// 等于"目标点实际移动的速度"，位置环把它和 P 项相加才不会错配。
+				ff_velocity(0) = ux_dir * setpoint_speed;
+				ff_velocity(1) = uy_dir * setpoint_speed;
+				_target(0) += ff_velocity(0) * dt;
+				_target(1) += ff_velocity(1) * dt;
+			}
+
+			publishTrajectorySetpoint(now, NAN, ff_velocity);
+
+			if (now - _last_track_log > kTrackLogInterval) {
+				_last_track_log = now;
+
+				const float ex = _target(0) - pos.x;
+				const float ey = _target(1) - pos.y;
+				const float track_dist = sqrtf(ex * ex + ey * ey);
+				const float along = ex * ux_dir + ey * uy_dir;          // 纵向
+				const float cross = ex * (-uy_dir) + ey * ux_dir;       // 侧向（左正右负）
+
+				PX4_INFO("my_mission: track |d|=%.2f m (along %.2f, cross %.2f)  sp %.2f m/s  v %.2f m/s",
+					 (double)track_dist, (double)along, (double)cross,
+					 (double)setpoint_speed, (double)sqrtf(pos.vx * pos.vx + pos.vy * pos.vy));
+			}
+
+			const matrix::Vector3f v(pos.vx, pos.vy, pos.vz);
+
+			// 到位判据 = "斜坡走完（setpoint 已经等于终点）**且**实际速度接近 0"。
+			// 这里故意不用 reachedTarget() 的位置半径：斜坡每拍都把 setpoint 精确推到
+			// 终点，速度归零本身就意味着到了；而位置半径会被跟踪残差/EKF 漂移拖成
+			// 永远差一点点 -> 走超时。
+			if (sp_at_goal && v.norm() < 0.3f) {
+				_state = State::Hover;
+				_state_start = now;
+				PX4_INFO("my_mission: reached forward point [%.2f %.2f], HOVER %.1f s",
+					 (double)_target(0), (double)_target(1), (double)_param_mym_hover.get());
+
+			} else if (elapsedSince(_state_start, now) > _param_mym_fwd_tmo.get()) {
+				// 飞不到（航向估计歪 / 顶风 / EKF 位置漂 / 速度给得太小）→ 不再硬追，
+				// 和起飞超时同样的策略：直接进降落流程，别一直在外面飞。
+				PX4_WARN("my_mission: forward timeout, going to LAND");
+				_state = State::Land;
+				_state_start = now;
+				_land_cmd_sent = false;
+			}
+
+			break;
 		}
-
-		break;
 
 	case State::Hover:
 		// 目标不变（起飞点上空，或者有 MYM_FWD_DIST 时是前方那个点），位置环自己维持。

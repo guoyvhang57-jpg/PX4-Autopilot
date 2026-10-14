@@ -42,6 +42,37 @@ parameters:
       min: -180.0
       max: 180.0
       unit: deg
+    MYM_FWD_SPD:
+      description:
+        short: 前飞巡航速度
+        long: |-
+          平飞段的最高速度，单位 m/s。起飞到点后，位置目标点不是一下子跳过去，
+          而是按这个速度一点点推过去（配合 MYM_FWD_ACC 走"加速-匀速-减速"三段），
+          所以实际地速基本等于这个值。
+          给小：慢、姿态平；给大：快、但倾角也大。
+          注意这是**惯性系**速度（对地），顶风时地速等于它、空速会更高。
+      type: float
+      default: 1.0
+      decimal: 2
+      min: 0.1
+      max: 10.0
+      unit: m/s
+    MYM_FWD_ACC:
+      description:
+        short: 前飞加/减速度上限
+        long: |-
+          加速段和减速段的加速度绝对值上限，单位 m/s^2。**这是决定姿态变化大小的
+          那个参数**：平飞需要的倾角大约是 atan(加速度 / 9.81)。
+          1.0 -> 约 6 度，2.0 -> 约 12 度，5.0 -> 约 27 度。
+          太小则速度爬升很慢（短距离时全程都在加减速，永远到不了 MYM_FWD_SPD）。
+          经验值：留 2 倍以上的余量给抗风，比赛/演示场合 1.0 ~ 2.0 最舒服。
+          顺带决定刹车距离 v^2/(2a)：1 m/s + 1.0 m/s^2 只要 0.5 m。
+      type: float
+      default: 1.0
+      decimal: 2
+      min: 0.1
+      max: 8.0
+      unit: m/s^2
     MYM_FWD_TMO:
       description:
         short: 前飞超时

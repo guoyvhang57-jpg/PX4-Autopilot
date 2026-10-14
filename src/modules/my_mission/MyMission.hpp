@@ -103,7 +103,7 @@ private:
 	enum class State {
 		Wait,     ///< 等 armed + Offboard + 位置有效；setpoint 钉在当前位置
 		Takeoff,  ///< 目标 = 地面参考上方 MYM_ALT，等位置/速度都到位
-		Forward,  ///< 目标 = 起飞点沿锁定航向前方 MYM_FWD_DIST（MYM_FWD_DIR 可偏）；仅 DIST>0 时进
+		Forward,  ///< 把 setpoint 以 MYM_FWD_SPD 推到前方点（MYM_FWD_ACC 限加減速）；仅 DIST>0 时进
 		Hover,    ///< 保持同一 setpoint MYM_HOVER 秒
 		Land,     ///< 方式 1：发 NAV_LAND 交 AUTO_LAND；方式 0：自己把 z 斜坡拉回地面
 		Disarm,   ///< 发 COMPONENT_ARM_DISARM(param1=0)，1 Hz 重试直到 !armed
@@ -117,7 +117,14 @@ private:
 	// z_velocity：可选的"下降速度前馈"。PositionControl 是 P-位置环 + 速度前馈
 	// （两者相加，不冲突），而 land detector 靠它判断"是否被指令下降"，所以
 	// 自己下降时**必须**给，否则 landed 永远上不去。NED，向下为正。
-	void publishTrajectorySetpoint(hrt_abstime now, float z_velocity = NAN);
+	//
+	// xy_velocity：可选的"水平速度前馈"，只有 FORWARD 的斜坡用（其余状态给默认
+	// NaN = 不控制，让位置环自己去算）。给它的意义：位置环的结构是
+	// vel_sp = 速度前馈 + MPC_XY_P * 位置误差，前馈给成"setpoint 正在移动的速度"
+	// 之后位置误差≈0，飞机就精确跟着 setpoint 走，不会因为追不上而滞后/超调。
+	// 只写 velocity[0..1]，不碰 velocity[2]，所以和 land detector 无关。
+	void publishTrajectorySetpoint(hrt_abstime now, float z_velocity = NAN,
+				       const matrix::Vector2f &xy_velocity = matrix::Vector2f(NAN, NAN));
 	void publishVehicleCommand(uint16_t command, float param1 = 0.f, float param2 = 0.f);
 
 	// ---- 状态判断 / 工具 ----
@@ -144,6 +151,19 @@ private:
 	float _ground_z{0.f};               ///< 进入 Offboard 时的 z（NED），作为降落的目标地面高度
 	float _yaw_sp{0.f};                 ///< 锁存的航向，每拍原样发给 trajectory_setpoint.yaw
 	float _takeoff_yaw{0.f};            ///< 起飞那一刻的航向，Forward 用它算"机头正前方"
+
+	// ---- FORWARD 的位置斜坡（xy 两轴）----
+	// _target 是"这一拍真正发出去的目标位置"，FORWARD 里它每拍朝 _fwd_goal 挪 ff_velocity*dt。
+	// 两者分开的意义：以前是把目标一次性跳到终点（阶跃 -> 位置环瞬间要最大速度 ->
+	// 姿态猛压）；现在终点和"正在走的中间点"分开，保证任意时刻的速度都可控。
+	//
+	// 两个速度量：
+	//   _ramp_speed      目标点**上一拍**的移动速度，状态量，只给下一拍的加速限幅用
+	//   setpoint_speed   目标点**这一拍**的移动速度 = 这一拍发给 PX4 的前馈速度
+	//                    （两者必须是同一个数，原因见 Run() 里 FORWARD 分支的注释）
+	matrix::Vector2f _fwd_goal{};       ///< FORWARD 的终点（xy，NED），进 FORWARD 时定死
+	float _ramp_speed{0.f};             ///< 目标点上一拍的移动速度（m/s），下一拍做加速限幅用
+	hrt_abstime _last_track_log{0};     ///< 上次打"目标点 vs 飞机距离"的时刻（仅监控）
 
 	// ---- 接管安全（油门回中检测）----	// 用 param_find 而不是 DEFINE_PARAMETERS：MAN_DEADZONE 归 manual_control 管，
 	// 这里只是"读它来和 PX4 的油门中位判据保持一致"，不想把它拉进本模块的参数表。
@@ -178,6 +198,8 @@ private:
 		(ParamFloat<px4::params::MYM_ALT>) _param_mym_alt,
 		(ParamFloat<px4::params::MYM_FWD_DIST>) _param_mym_fwd_dist,
 		(ParamFloat<px4::params::MYM_FWD_DIR>) _param_mym_fwd_dir,
+		(ParamFloat<px4::params::MYM_FWD_SPD>) _param_mym_fwd_spd,
+		(ParamFloat<px4::params::MYM_FWD_ACC>) _param_mym_fwd_acc,
 		(ParamFloat<px4::params::MYM_FWD_TMO>) _param_mym_fwd_tmo,
 		(ParamFloat<px4::params::MYM_HOVER>) _param_mym_hover,
 		(ParamInt<px4::params::MYM_LAND_MODE>) _param_mym_land_mode,
