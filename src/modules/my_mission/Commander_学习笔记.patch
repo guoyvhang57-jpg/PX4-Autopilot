@@ -1,0 +1,198 @@
+diff --git a/src/modules/commander/Commander.cpp b/src/modules/commander/Commander.cpp
+index 3cb6e65982..2978ec55e1 100644
+--- a/src/modules/commander/Commander.cpp
++++ b/src/modules/commander/Commander.cpp
+@@ -752,17 +752,20 @@ transition_result_t Commander::disarm(arm_disarm_reason_t calling_reason, bool f
+ 	if (!isArmed()) {
+ 		return TRANSITION_NOT_CHANGED;
+ 	}
+-
++	//强制检查，默认false，想跳过显式写true
+ 	if (!forced) {
++		//在landed，maybe_land，或一些没有明确降落的机型
+ 		const bool landed = (_vehicle_land_detected.landed || _vehicle_land_detected.maybe_landed
+ 				     || is_ground_vehicle(_vehicle_status));
++		//在旋翼模式，_vehicle_control_mode中的flag_control_manual_enabled（手动控制为真），没有爬升率控制
+ 		const bool mc_manual_thrust_mode = _vehicle_status.vehicle_type == vehicle_status_s::VEHICLE_TYPE_ROTARY_WING
+ 						   && _vehicle_control_mode.flag_control_manual_enabled
+ 						   && !_vehicle_control_mode.flag_control_climb_rate_enabled;
++		//看disarm理由是不是遥控器指令。手势/拨杆，按钮
+ 		const bool commanded_by_rc = (calling_reason == arm_disarm_reason_t::stick_gesture)
+ 					     || (calling_reason == arm_disarm_reason_t::rc_switch)
+ 					     || (calling_reason == arm_disarm_reason_t::rc_button);
+-
++		//拒绝条件，还有是否要报警
+ 		if (!landed && !(mc_manual_thrust_mode && commanded_by_rc)) {
+ 			if (calling_reason != arm_disarm_reason_t::stick_gesture) {
+ 				mavlink_log_critical(&_mavlink_log_pub, "Disarming denied: not landed\t");
+@@ -774,7 +777,7 @@ transition_result_t Commander::disarm(arm_disarm_reason_t calling_reason, bool f
+ 			return TRANSITION_DENIED;
+ 		}
+ 	}
+-
++	//决定上锁，清一些标志位
+ 	_vehicle_status.armed_time = 0;
+ 	_vehicle_status.arming_state = vehicle_status_s::ARMING_STATE_DISARMED;
+ 	_vehicle_status.latest_disarming_reason = (uint8_t)calling_reason;
+@@ -2015,42 +2018,62 @@ void Commander::run()
+ 
+ 		systemPowerUpdate();
+ 
++
++		//把vtol_vehicle_status话题中数据copy到_vtol_vehicle_status（command成员），主要是landed被使用，_home_position对象往home_position话题中发布home点信息
+ 		landDetectorUpdate();
+ 
+ 		safetyButtonUpdate();
+ 
++		//抛飞，不用管
+ 		_multicopter_throw_launch.update(isArmed());
+ 
+ 		vtolStatusUpdate();
+ 
++		//飞行器当前处于自动任务模式，并且任务结果消息显示任务尚未完成为真
+ 		_mission_in_progress = (_vehicle_status.nav_state == vehicle_status_s::NAVIGATION_STATE_AUTO_MISSION)
+ 				       && !_mission_result_sub.get().finished;
+ 
++		//_home_position在landDetectorUpdate定好home点后根据实际情况维护home点（只往_home_position成员内部写）
+ 		_home_position.update(_param_com_home_en.get(), !isArmed() && _vehicle_land_detected.landed && !_mission_in_progress
+ 				      && !_config_overrides.disable_auto_set_home);
+ 
++		//自动上锁，根据自动上锁参数，是否在任务中，外部模式，kill开关，_vehicle_land_detected话题数据，在降落后，解锁未操作，kill开关后，执行disarm函数上锁
++		//不改变什么成员变量，只是发送disarm动作
+ 		handleAutoDisarm();
+ 
+ 		battery_status_check();
+-
++/*------------------------------------------------------------------------------*/
++
++		//功能 A：任务有效性变化 → 响一声
++		/* 已解锁
++		 不在落地状态（!landed）
++		 mission_result.timestamp >= nav_state_timestamp —— 结果比当前模式更新（防止旧结果把刚切进去的新模式踢掉）
++		 mission_result.finished（任务完成或被清空）
++		 没有外部 mode executor 负责（modeExecutorInCharge() == AUTOPILOT_EXECUTOR_ID）——外部执行器自己会管，别抢
++		 然后分两种：
++		 当前在 AUTO_TAKEOFF / AUTO_VTOL_TAKEOFF → 强制切 Hold（force=true，来源 ModeExecutor）——起飞完成后的正常去处
++		 当前在 AUTO_MISSION → 切 Hold，但不强制（要过 canRun），且只在"意图仍是 AUTO_MISSION"时才切（避免覆盖已经排队的 RTL 等请求）*/
++		 //，属于上层意图，要过_user_mode_intention成员的change检测
+ 		checkForMissionUpdate();
+ 
++		//在解锁模式下检测摇杆动作，如果比设定值大，经过条件判断通过user_mode写入意图
+ 		manualControlCheck();
+-
++		//遥控信号丢失处理
+ 		manualControlLossModeSwitch();
+-
++		//丢失后给_status_changed = true
+ 		offboardControlCheck();
+ 
+ 		// data link checks which update the status
+ 		dataLinkCheck();
+ 
+ 		// Check for failure detector status
++		//通过订阅无人机数据，判断是否姿态出问题，高度异常下降，螺旋桨出问题带来振动异常，然后写入_failure_detector对象内部flag
+ 		if (_failure_detector.update(_vehicle_status, _vehicle_control_mode)) {
+ 			_status_changed = true;
+ 		}
+-
++		//外部模式管理，目前不看
+ 		modeManagementUpdate();
+-
++/*-------------------------------------------------------------------------------------------------*/
+ 		const hrt_abstime now = hrt_absolute_time();
+ 
+ 		const bool nav_state_or_failsafe_changed = handleModeIntentionAndFailsafe();
+@@ -2085,7 +2108,7 @@ void Commander::run()
+ 				}
+ 			}
+ 		}
+-
++/*--------------------------------------------------------------------------------------------------------------------------------------------------*/
+ 		// handle commands last, as the system needs to be updated to handle them
+ 		handleCommandsFromModeExecutors();
+ 
+@@ -2117,7 +2140,7 @@ void Commander::run()
+ 				executeActionRequest(action_request);
+ 			}
+ 		}
+-
++/*-------------------------------------------------------------------------------------------------------------------------------------------------*/
+ 		// update actuator_armed
+ 		_actuator_armed.armed = isArmed();
+ 		_actuator_armed.prearmed = getPrearmState();
+@@ -2156,7 +2179,6 @@ void Commander::run()
+ 
+ 		updateTunes();
+ 		control_status_leds(_status_changed, _battery_warning);
+-
+ 		_status_changed = false;
+ 
+ 		arm_auth_update(hrt_absolute_time(), params_updated);
+@@ -2521,6 +2543,7 @@ bool Commander::handleModeIntentionAndFailsafe()
+ 
+ 	// There might have been a mode change request without changing the user intended mode.
+ 	// If a failsafe is active we must pass the request along as it might lead to a user-takeover.
++	//立刻知道"意图是否被受理"（true/false），以及"本拍有过一次请求"（_had_mode_change，读走即清）
+ 	bool mode_change_requested = _user_mode_intention.getHadModeChangeAndClear();
+ 
+ 	uint8_t updated_user_intented_mode = _failsafe.update(hrt_absolute_time(), state, mode_change_requested,
+@@ -3138,10 +3161,13 @@ void Commander::manualControlCheck()
+ 			const bool rotary_wing = (_vehicle_status.vehicle_type == vehicle_status_s::VEHICLE_TYPE_ROTARY_WING);
+ 			const bool overridable_mode = _vehicle_control_mode.flag_control_auto_enabled || _vehicle_control_mode.flag_control_offboard_enabled;
+ 
++			//摇杆运动超过某一值&&四旋翼模式&&可以被接管的模式（mossion，offboard）
+ 			if (manual_control_setpoint.sticks_moving && rotary_wing && overridable_mode) {
+ 				// If no failsafe is active, directly change the mode, otherwise pass the request to the failsafe state machine
+ 				if (_failsafe.selectedAction() <= FailsafeBase::Action::Warn) {
++					//想要改变模式，一般都要先通过_user_mode_intentio登记意图，然后再由failsafe裁决
+ 					if (_user_mode_intention.change(vehicle_status_s::NAVIGATION_STATE_POSCTL, ModeChangeSource::User, true)) {
++						//给出操作成功信息（灯或蜂鸣器以及mavlink消息）
+ 						tune_positive(true);
+ 						mavlink_log_info(&_mavlink_log_pub, "Pilot took over using sticks\t");
+ 						events::send(events::ID("commander_rc_override"), events::Log::Info, "Pilot took over using sticks");
+diff --git a/src/modules/commander/failsafe/framework.cpp b/src/modules/commander/failsafe/framework.cpp
+index a03992eef6..76eaace61e 100644
+--- a/src/modules/commander/failsafe/framework.cpp
++++ b/src/modules/commander/failsafe/framework.cpp
+@@ -57,13 +57,13 @@ uint8_t FailsafeBase::update(const hrt_abstime &time_us, const State &state, boo
+ 	if (_last_update == 0) {
+ 		_last_update = time_us;
+ 	}
+-
++	//在解锁和上锁时，把状态归位但保留还为解决的问题，主要操作ActionOptions _actions[8]
+ 	if ((_last_armed && !state.armed) || (!_last_armed && state.armed)) { // Disarming or Arming
+ 		removeActions(ClearCondition::OnDisarm);
+ 		removeActions(ClearCondition::OnModeChangeOrDisarm);
+ 		_user_takeover_active = false;
+ 	}
+-
++	//看两种情况是否发生了模式变化
+ 	user_intended_mode_updated |= _last_user_intended_mode != state.user_intended_mode;
+ 
+ 	if (user_intended_mode_updated || _user_takeover_active) {
+diff --git a/src/modules/commander/failure_detector/FailureDetector.cpp b/src/modules/commander/failure_detector/FailureDetector.cpp
+index 8913f35710..a80e2919d8 100644
+--- a/src/modules/commander/failure_detector/FailureDetector.cpp
++++ b/src/modules/commander/failure_detector/FailureDetector.cpp
+@@ -57,9 +57,11 @@ bool FailureDetector::update(const vehicle_status_s &vehicle_status, const vehic
+ 	failure_detector_status_u status_prev = _failure_detector_status;
+ 
+ 	if (vehicle_control_mode.flag_control_attitude_enabled) {
++		//读取姿态数据，和阈值对比，要持续超过，判断是否出错，写flags.roll / flags.pitch
+ 		updateAttitudeStatus(vehicle_status);
++		//判断"是不是在不受控地掉高度" 写 flags.alt，falg是_failure_detector_status对象成员
+ 		updateAltitudeStatus(vehicle_status, vehicle_control_mode);
+-
++		//参数_param_fd_ext_ats_en是是否要根据外部数据判断pwm信号处问题了吗
+ 		if (_param_fd_ext_ats_en.get()) {
+ 			updateExternalAtsStatus();
+ 		}
+@@ -73,7 +75,7 @@ bool FailureDetector::update(const vehicle_status_s &vehicle_status, const vehic
+ 		_alt_loss_ref_z = NAN;
+ 		_alt_loss_hysteresis.set_state_and_update(false, hrt_absolute_time());
+ 	}
+-
++	//通过加速度计的水平与垂直振动标准差差异来判断某个桨叶坏了、缺角、或电机异常
+ 	if (_param_fd_imb_prop_thr.get() > 0) {
+ 		updateImbalancedPropStatus();
+ 	}
