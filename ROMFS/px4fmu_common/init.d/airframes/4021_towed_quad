@@ -1,0 +1,208 @@
+#!/bin/sh
+#
+# @name Towed Quad (4 lift + 2 forward thrust)
+#
+# @type Quadrotor x
+# @class Copter
+#
+# @maintainer TODO
+#
+# ===========================================================================
+# 当前档位：**只启用 4 个升力旋翼**（和真机现状一致，5/6 路还没接线/标定）
+#   下面"6 旋翼"整段是注释状态：CA_ROTOR4/5_*、FUNC5/6=105/106、CT4/5。
+#   5/6 路用 FUNC=1(Constant_Min) 停用 —— 和真机日志 log100.ulg 完全一致。
+#   等推力电调接好、行程标定完，把那段整体打开，并把 CA_ROTOR_COUNT 改成 6。
+# ===========================================================================
+#
+# 坐标系：CA_ROTORn_PX/PY/PZ 用 FRD（x 前 / y 右 / z 下），单位 m，相对重心。
+#
+# 参数来源：
+#   - 几何        ：towed 构型几何（真机实测，和 SITL 4022_gz_towed 一致）
+#   - PWM 1100/1900：真机日志 log100.ulg / log100_3.ulg 实测（升力 1..4）
+#   - 悬停 0.46   ：4 个升力桨扛 4.087 kg -> 40.1 N / (4 x 21.6 N)
+#
+# ⚠ 解锁前必须核对：几何、CT、PWM 输出映射、5/6 路的行程。
+# ===========================================================================
+
+. ${R}etc/init.d/rc.mc_defaults
+
+# ---------------------------------------------------------------------------
+# 控制分配：4 个升力旋翼（推力轴朝上 (0,0,-1)，用 CA_ROTORn 默认 AX/AY/AZ）
+# ---------------------------------------------------------------------------
+param set-default CA_AIRFRAME 0
+param set-default CA_ROTOR_COUNT 4
+
+param set-default CA_ROTOR0_PX  0.29898    # 右前 ccw
+param set-default CA_ROTOR0_PY  0.33634
+param set-default CA_ROTOR0_KM  0.025
+param set-default CA_ROTOR1_PX -0.29898    # 左后 ccw
+param set-default CA_ROTOR1_PY -0.33634
+param set-default CA_ROTOR1_KM  0.025
+param set-default CA_ROTOR2_PX  0.29898    # 左前 cw
+param set-default CA_ROTOR2_PY -0.33634
+param set-default CA_ROTOR2_KM -0.025
+param set-default CA_ROTOR3_PX -0.29898    # 右后 cw
+param set-default CA_ROTOR3_PY  0.33634
+param set-default CA_ROTOR3_KM -0.025
+
+# ---------------------------------------------------------------------------
+# 单桨满推推力 CT [N] —— towed 标定值
+#   配合 THR_MDL_FAC = 1.0，分配器用线性模型 Thrust = CT · u²，
+#   所以 CT 必须等于"该桨满油门时的真实推力"。换桨/换电机要重新实测。
+# ---------------------------------------------------------------------------
+param set-default CA_ROTOR0_CT 21.6
+param set-default CA_ROTOR1_CT 21.6
+param set-default CA_ROTOR2_CT 21.6
+param set-default CA_ROTOR3_CT 21.6
+param set-default THR_MDL_FAC 1.0
+
+# ---------------------------------------------------------------------------
+# 输出映射（Nora 没有独立 IO 芯片 → pwm_out 的前缀是 PWM_MAIN，不是 PWM_AUX）
+#   1..4 = Motor1..4 对应上面的 CA_ROTOR0..3（真机日志确认）
+#   5/6  = Constant_Min：停用这两路，和实机现状一致
+#   行程 1100/1900 来自真机日志；5/6 的 900 是"停用"状态下的最小值
+# ---------------------------------------------------------------------------
+param set-default PWM_MAIN_FUNC1 101
+param set-default PWM_MAIN_FUNC2 102
+param set-default PWM_MAIN_FUNC3 103
+param set-default PWM_MAIN_FUNC4 104
+param set-default PWM_MAIN_FUNC5 1
+param set-default PWM_MAIN_FUNC6 1
+
+param set-default PWM_MAIN_MIN1 1100
+param set-default PWM_MAIN_MIN2 1100
+param set-default PWM_MAIN_MIN3 1100
+param set-default PWM_MAIN_MIN4 1100
+param set-default PWM_MAIN_MIN5 900
+param set-default PWM_MAIN_MIN6 900
+param set-default PWM_MAIN_MAX1 1900
+param set-default PWM_MAIN_MAX2 1900
+param set-default PWM_MAIN_MAX3 1900
+param set-default PWM_MAIN_MAX4 1900
+
+# ===========================================================================
+# ↓↓↓ 6 旋翼（2 个前向推力旋翼）—— 接线 + 台架标定完再整体打开 ↓↓↓
+# ===========================================================================
+# param set-default CA_ROTOR_COUNT 6
+#
+# --- 前向推力旋翼：+70° 安装角，推力轴 = 前 0.940 / 上 0.342（FRD 下 AZ 为负）---
+# PZ = -0.283：推力线在重心上方 0.283 m，分配器据此自动配平抬头力矩，必须填对
+# PY = 0      ：故意不告诉它力臂，避免分配器用这两路做偏航（要差动偏航再改 ±0.55）
+# param set-default CA_ROTOR4_PX  0
+# param set-default CA_ROTOR4_PY  0
+# param set-default CA_ROTOR4_PZ -0.283
+# param set-default CA_ROTOR4_AX  0.940
+# param set-default CA_ROTOR4_AY  0
+# param set-default CA_ROTOR4_AZ -0.342
+# param set-default CA_ROTOR4_KM  0
+# param set-default CA_ROTOR5_PX  0
+# param set-default CA_ROTOR5_PY  0
+# param set-default CA_ROTOR5_PZ -0.283
+# param set-default CA_ROTOR5_AX  0.940
+# param set-default CA_ROTOR5_AY  0
+# param set-default CA_ROTOR5_AZ -0.342
+# param set-default CA_ROTOR5_KM  0
+#
+# --- 推力桨 CT：和升力桨的桨/电机不同就分别实测填写 ---
+# param set-default CA_ROTOR4_CT 21.6
+# param set-default CA_ROTOR5_CT 21.6
+#
+# --- 输出：先把上面 FUNC5/6 = 1 那两行删掉，再启用下面这些 ---
+# ⚠ 5/6 的行程必须单独标定，不能照抄升力桨的 1100/1900（日志里那组 900/1900 是停用值）
+# param set-default PWM_MAIN_FUNC5 105
+# param set-default PWM_MAIN_FUNC6 106
+# param set-default PWM_MAIN_MIN5 1100
+# param set-default PWM_MAIN_MIN6 1100
+# param set-default PWM_MAIN_MAX5 1900
+# param set-default PWM_MAIN_MAX6 1900
+# ===========================================================================
+
+# 该机没有空速管
+param set-default SYS_HAS_NUM_ASPD 0
+
+# ---------------------------------------------------------------------------
+# 控制参数
+# 悬停油门：4 个升力桨扛 4.087 kg -> 40.1 N / (4 x 21.6 N) = 0.46
+#   （真机日志实测悬停指令是 0.38~0.41，但那是通用四旋翼 CT=6.5 下的值，
+#     换了 CT=21.6 的 towed 标定后不能直接抄，要按 mg/(4·CT) 重算。）
+# 电池：真机是 6S 6000 mAh（日志 BAT1_N_CELLS=6 / BAT1_CAPACITY=6000），
+#       但日志里 BAT1_V_DIV=0、I_CHANNEL=-1，电池监控没配 -> 要用得自己配好。
+# ---------------------------------------------------------------------------
+param set-default MPC_THR_HOVER 0.46
+param set-default MC_AIRMODE 1
+param set-default NAV_DLL_ACT 2
+
+# ---------------------------------------------------------------------------
+# 解锁方式：遥控器手势（不用地面站、不用解锁开关）
+#
+#   手势 = 左杆油门最低 + 左杆偏航打满右 + 右杆回中，保持 1 s
+#   退锁 = 左杆油门最低 + 左杆偏航打满左 + 右杆回中，保持 1 s
+#   （1 s 是 manual_control 里 _stick_arm_hysteresis 的固定迟滞）
+#
+#   ⚠ 要回中的只有**右杆**。油门不能回中 —— 判定是 `throttle < -0.8`
+#     （归一化后最低 = -1、中位 = 0），油门在中位判不出来，必须一直压到底。
+#     自回中的发射机要用手指按住。解锁后油门放在哪都不影响 Offboard 任务
+#     （Offboard 里 flag_control_manual_enabled 恒为 false），
+#     真正要松开的是偏航杆 —— 那一下就是 sticks_moving。
+#
+# 下面三个必须成立，否则手势要么被禁用、要么刚解锁就被打断：
+#
+#   RC_MAP_ARM_SW = 0       只要配了解锁开关，manual_control 启动时会把
+#                           MAN_ARM_GESTURE 自动改成 0（ManualControl::updateParams）
+#   MAN_ARM_GESTURE = 1     手势总开关
+#   MAN_OVERRIDE_SPD < 0    关掉"摇杆接管"。否则解锁后把偏航杆回中会被判成
+#                           sticks_moving，commander 立刻切到 Position 模式 ->
+#                           掉出 Offboard -> my_mission 判定异常直接中止。
+#                           （v1.17 固件上这个开关叫 COM_RC_OVERRIDE，默认 1 =
+#                             只有 auto 模式能被摇杆接管、offboard 不接管，
+#                             所以 v1.17 上不需要改这一项。）
+#   MC_AIRMODE != 2         偏航 airmode 也会强制禁用手势；本机是 1，没问题
+#
+# ⚠ 上面的 NAV_DLL_ACT = 2 还额外要求"必须有地面站连接才能解锁"
+#   （commander/HealthAndArmingChecks/checks/rcAndDataLinkCheck.cpp）。
+#   要纯遥控手势、不接地面站起飞，必须把 NAV_DLL_ACT 设成 0，
+#   否则会报 "Preflight Fail: No connection to the GCS" 而拒绝解锁。
+#
+# ⚠ 这些只是 airframe 的 **默认值**，只有在参数还没被改过时才生效。
+#   飞控上已经存过参数的话，用 QGC 或 MAVLink Console 核对并强制一次：
+#     param show RC_MAP_ARM_SW MAN_ARM_GESTURE MAN_OVERRIDE_SPD MC_AIRMODE
+#     param set  RC_MAP_ARM_SW 0
+#     param set  MAN_ARM_GESTURE 1
+#     param set  MAN_OVERRIDE_SPD -1
+#     param save
+# ---------------------------------------------------------------------------
+param set-default RC_MAP_ARM_SW 0
+param set-default MAN_ARM_GESTURE 1
+param set-default MAN_OVERRIDE_SPD -1
+
+# ---------------------------------------------------------------------------
+# Offboard 位置任务：起飞 -> 向前飞到目标点 -> 悬停 -> 降落 -> 上锁
+#
+#   飞手操作顺序（my_mission 自己不 arm、也不自己切模式）：
+#     1) 确认位置有效 —— position 型 Offboard 硬前提（offboardCheck.cpp:56）
+#     2) 模式开关切到 Offboard 档 —— COM_FLTMODE<n> = 7
+#        此时还没解锁是正常的：本模块从 start 起就 50 Hz 发 offboard_control_mode，
+#        commander 允许在"未解锁"状态下就切进 Offboard。
+#        （反过来先解锁、再切进 Offboard 也能跑，但那样等于把已解锁的飞机
+#          切进 Offboard，切进去那一刻就会起飞，所以推荐先模式后解锁。）
+#        ⚠ 这个顺序只在 v1.18 上成立。v1.17 的 Commander::arm() 里有
+#          `else if (calling_reason == stick_gesture || rc_switch || rc_button)
+#             -> "Arming denied: switch to manual mode first"`，
+#          而 Offboard 的 flag_control_manual_enabled 恒为 false，
+#          所以 v1.17 上必须反过来：先在 Stabilized/Altitude 手势解锁，
+#          再切 Offboard（切进去就是起飞）。v1.18 已把那个分支删掉。
+#     3) 遥控器手势解锁（油门最低 + 偏航打满右，保持 1 s）
+#     4) 模块检测到 (armed && offboard && 位置有效) -> 自动起飞
+#        -> 向前飞 MYM_FWD_DIST 米（= 0 则跳过）-> 悬停 -> 降落 -> 自己上锁
+#     5) 结束后把模式开关拨回去；飞行中途也可以用手势退锁来中止任务
+#
+#   第一次务必拆桨 / 系留验证。
+#
+#   ⚠ 应急接管：手势解锁后油门正好停在最低，此时直接拨到 Position/Altitude
+#     会**立刻以 MPC_Z_VEL_MAX_DN 下降**（FlightTaskManualAltitude 里高度由
+#     油门杆决定，且没有"等杆回中"的闩锁）。正确顺序是两段式：
+#       Offboard -> Hold（COM_FLTMODE<n> = 4，不吃摇杆）-> 油门回中 -> Position
+#     水平/姿态不会跳变（activate() 用当前位置/零速度初始化），只有高度会变。
+#     my_mission 会在离开 Offboard 且油门未回中时发 Critical 告警，但拦不住下降。
+# ---------------------------------------------------------------------------
+my_mission start

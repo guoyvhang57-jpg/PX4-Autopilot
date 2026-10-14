@@ -68,6 +68,7 @@ if(CONFIG_MODULES_MC_RATE_CONTROL)
 		4017_nxp_hovergames
 		4019_x500_v2
 		4020_holybro_px4vision_v1_5
+		4021_towed_quad
 		4041_beta75x
 		4050_generic_250
 		4052_holybro_qav250
