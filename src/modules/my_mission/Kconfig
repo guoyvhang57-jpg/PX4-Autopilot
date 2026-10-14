@@ -1,0 +1,10 @@
+menuconfig MODULES_MY_MISSION
+	bool "my_mission"
+	default n
+	---help---
+		Enable support for my_mission.
+
+		Offboard 位置控制的最小任务示例：起飞到指定高度 -> 向前飞到目标点 -> 悬停
+		-> 降落 -> 上锁。模块持续发布 offboard_control_mode(position=true) 和
+		trajectory_setpoint，用 state machine 依次走
+		WAIT / TAKEOFF / FORWARD / HOVER / LAND / DISARM / DONE。

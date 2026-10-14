@@ -1,0 +1,147 @@
+module_name: my_mission
+parameters:
+- group: My Mission
+  definitions:
+    MYM_ALT:
+      description:
+        short: 起飞目标高度
+        long: |-
+          进入 Offboard 后相对"进入点"（通常是地面）上升多少，单位 m。
+          目标位置 = 进入时的位置，z 再减去这个值（NED 向上为负）。
+      type: float
+      default: 1.0
+      decimal: 2
+      min: 0.2
+      max: 50.0
+      unit: m
+    MYM_FWD_DIST:
+      description:
+        short: 起飞后向前飞的距离
+        long: |-
+          到了 MYM_ALT 之后，沿"起飞那一刻锁定的机头方向"（不是正北）再平飞这么远，
+          到点后悬停 MYM_HOVER 秒再降落。单位 m。
+          0 = 不飞：跳过 FORWARD 状态，行为和不启用这个功能时完全一样。
+          方向由航向估计决定（GPS 双天线 / 磁罗盘 / EKF），航向歪多少度就飞歪多少度，
+          距离越大偏得越远。第一次试先给小值（1~2 m），MYM_ALT 给高一点。
+      type: float
+      default: 3.0
+      decimal: 2
+      min: 0.0
+      max: 500.0
+      unit: m
+    MYM_FWD_DIR:
+      description:
+        short: 前飞方向相对机头的偏角
+        long: |-
+          相对"起飞时的机头方向"再偏多少度，用来往侧面飞。
+          0 = 正前方，+90 = 起飞航向的右侧，-90 = 左侧，180 = 正后方。
+          只在 MYM_FWD_DIST > 0 时有意义。
+      type: float
+      default: 0.0
+      decimal: 1
+      min: -180.0
+      max: 180.0
+      unit: deg
+    MYM_FWD_TMO:
+      description:
+        short: 前飞超时
+        long: |-
+          超过这个时间还没到达前飞目标点（航向估计歪 / 顶风 / EKF 位置漂 /
+          MYM_ARRIVE 太小），就不再硬追，直接进入降落流程。
+      type: float
+      default: 20.0
+      decimal: 1
+      min: 3.0
+      max: 120.0
+      unit: s
+    MYM_HOVER:
+      description:
+        short: 到达目标点后的悬停时间
+      type: float
+      default: 5.0
+      decimal: 1
+      min: 0.0
+      max: 600.0
+      unit: s
+    MYM_LAND_MODE:
+      description:
+        short: 降落方式
+        long: |-
+          0 = 纯 Offboard 下降：把 trajectory_setpoint 的 z 以 MYM_DESC_RATE 抬回 0，
+              同时把该速率作为 velocity[2] 前馈一起发出去（land detector 判断
+              "是否被指令下降"读的就是它，不发就永远判不着地、也就永远上不了锁）。
+          1 = 交给 PX4 的 AUTO_LAND：发 MAV_CMD_NAV_LAND，收油门 / flare / 着陆检测 /
+              自动上锁全部由 PX4 负责。更稳，推荐。
+      type: int32
+      values:
+        0: Offboard descent
+        1: PX4 AUTO_LAND
+      default: 1
+    MYM_DESC_RATE:
+      description:
+        short: Offboard 下降速率（仅 MYM_LAND_MODE=0）
+        long: |-
+          下限被强制抬到 1.1 x LNDMC_Z_VEL_MAX（默认 0.25 -> 0.275 m/s）：
+          低于它 land detector 的 in_descend 恒为 false，ground_contact /
+          maybe_landed / landed 永远上不去，之后发的 disarm 会被 commander 拒绝。
+          设得比它小会被抬上去并打一条告警。
+      type: float
+      default: 0.4
+      decimal: 2
+      min: 0.1
+      max: 3.0
+      unit: m/s
+    MYM_ARRIVE:
+      description:
+        short: 到达目标点的判定半径
+        long: |-
+          位置误差小于这个值、且速度小于 0.3 m/s 时判定"到位"。
+          定得太小可能因为稳态误差永远到不了，最后走超时。
+      type: float
+      default: 0.20
+      decimal: 2
+      min: 0.05
+      max: 2.0
+      unit: m
+    MYM_TKO_TMO:
+      description:
+        short: 起飞超时
+        long: |-
+          超过这个时间还没到达 MYM_ALT 就放弃起飞、直接进入降落流程。
+      type: float
+      default: 20.0
+      decimal: 1
+      min: 3.0
+      max: 120.0
+      unit: s
+    MYM_LAND_TMO:
+      description:
+        short: 降落超时
+        long: |-
+          MYM_LAND_MODE=1 时，超过这个时间既没上锁也没判着地，就转去尝试上锁。
+      type: float
+      default: 40.0
+      decimal: 1
+      min: 5.0
+      max: 180.0
+      unit: s
+    MYM_AUTO_DISARM:
+      description:
+        short: 降落后自动上锁
+        long: |-
+          1 = 检测到着地后由本模块发 disarm。MYM_LAND_MODE=1 时 PX4 自己也会按
+          COM_DISARM_LAND 上锁，谁先到都算数。
+      type: int32
+      values:
+        0: Disabled
+        1: Enabled
+      default: 1
+    MYM_DISARM_TMO:
+      description:
+        short: 上锁超时
+      type: float
+      default: 10.0
+      decimal: 1
+      min: 1.0
+      max: 60.0
+      unit: s
