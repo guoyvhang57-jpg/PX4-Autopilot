@@ -52,7 +52,7 @@ parameters:
           给小：慢、姿态平；给大：快、但倾角也大。
           注意这是**惯性系**速度（对地），顶风时地速等于它、空速会更高。
       type: float
-      default: 1.0
+      default: 0.5
       decimal: 2
       min: 0.1
       max: 10.0
@@ -112,10 +112,17 @@ parameters:
       description:
         short: Offboard 下降速率（仅 MYM_LAND_MODE=0）
         long: |-
-          下限被强制抬到 1.1 x LNDMC_Z_VEL_MAX（默认 0.25 -> 0.275 m/s）：
-          低于它 land detector 的 in_descend 恒为 false，ground_contact /
-          maybe_landed / landed 永远上不去，之后发的 disarm 会被 commander 拒绝。
-          设得比它小会被抬上去并打一条告警。
+          下限被强制抬到 1.1 x LNDMC_Z_VEL_MAX（默认 0.25 -> 0.275 m/s）。
+          这个 1.1 不是本模块自己定的，是 PX4 land detector 的判据本身：
+          MulticopterLandDetector.cpp:242
+              _in_descend = isfinite(setpoint.velocity[2])
+                            && (setpoint.velocity[2] >= 1.1f * LNDMC_Z_VEL_MAX)
+          紧接着 :248 是 ground_contact &= _in_descend，所以下降指令速度低于
+          0.275 m/s 时 ground_contact 恒为假，maybe_landed / landed 永远上不去，
+          之后发的 disarm 会被 commander 拒绝。
+          本模块只是把这条 PX4 判据提前算一遍，好在参数设错时告警而不是默默降不下去。
+          设得比下限小会被抬上去并打一条告警。
+          想让着陆更柔和请用 MYM_LAND_MODE=1（PX4 AUTO_LAND，自带 flare）。
       type: float
       default: 0.4
       decimal: 2

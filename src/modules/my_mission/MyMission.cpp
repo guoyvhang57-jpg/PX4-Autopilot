@@ -154,14 +154,6 @@
 #include <px4_platform_common/log.h>
 #include <px4_platform_common/posix.h>
 
-// ===========================================================================
-// kTrackLogInterval：FORWARD 期间"目标点 vs 飞机实际位置"打点的间隔
-// ===========================================================================
-// 现在**只监控、不做任何控制动作**：斜坡照样按曲线推进、前馈照样照发，
-// 只是每 0.5 秒把"目标点离飞机多远"打一行出来，用来观察跟踪质量。
-// 等看清了实际会有多大滞后 / 多少侧向偏差，再决定要不要加限幅。
-static constexpr hrt_abstime kTrackLogInterval{500_ms};
-
 ModuleBase::Descriptor MyMission::desc{task_spawn, custom_command, print_usage};
 
 MyMission::MyMission()
@@ -426,6 +418,22 @@ void MyMission::updateExternalParams()
 	if ((_param_lndmc_z_vel_max != PARAM_INVALID) && (param_get(_param_lndmc_z_vel_max, &lndmc_z_vel_max) == PX4_OK)) {
 		_in_descend_min_vel = 1.1f * lndmc_z_vel_max;
 	}
+
+	// MPC_XY_ERR_MAX：PX4 自己轨迹生成器的"允许的最大水平跟踪误差"，
+	// **本模块直接复用这个值**，不另造一个 MYM_ 参数。理由：
+	//   1) 它的语义就是"目标点落后飞机不能超过多少"，正对上 FORWARD 斜坡要做的事；
+	//   2) PX4 默认已经调到 2.0 m，是验证过的值，自己再发明一个数字没有依据；
+	//   3) 和上面 LNDMC_Z_VEL_MAX 同一个套路 —— 需要和 PX4 行为对齐的阈值就抄 PX4 的。
+	// 用法见 FORWARD 分支里的"跟踪限幅"，口径也和 PX4 一致（2D 距离 + 方向判据）。
+	if (_param_mpc_xy_err_max == PARAM_INVALID) {
+		_param_mpc_xy_err_max = param_find("MPC_XY_ERR_MAX");
+	}
+
+	float xy_err_max = _mpc_xy_err_max;
+
+	if ((_param_mpc_xy_err_max != PARAM_INVALID) && (param_get(_param_mpc_xy_err_max, &xy_err_max) == PX4_OK)) {
+		_mpc_xy_err_max = xy_err_max;
+	}
 }
 
 bool MyMission::throttleStickCentered(const manual_control_setpoint_s &manual_control) const
@@ -669,9 +677,48 @@ void MyMission::Run()
 			const float uy_dir = (dist > 1e-3f) ? (dy / dist) : 0.f;
 
 			// ===================================================================
+			// 速度曲线：目标点每拍该往前挪多快
+			// ===================================================================
+			// 只看 setpoint 到终点的距离，**完全不看飞机在哪**：
+			//   加速限幅  _ramp_speed + acc*dt   这一拍最多比上一拍快这么多
+			//   巡航上限  spd                     MYM_FWD_SPD
+			//   刹车限幅  sqrt(2*acc*dist)        还能正好刹停在终点的最高速度（v²=2as 反解）
+			// 取三者最小，自动形成"加速-匀速-减速"。近处第三项更小，整个曲线退化成三角形。
+			//
+			// _ramp_speed 是**上一拍**的曲线速度，只给这里的加速限幅用。
 			float setpoint_speed = math::min(spd, _ramp_speed + acc * dt);
 			setpoint_speed = math::min(setpoint_speed, sqrtf(2.f * acc * dist));
-			_ramp_speed = setpoint_speed;   // 状态：供下一拍的加速限幅用
+			_ramp_speed = setpoint_speed;
+
+			// ===================================================================
+			// 跟踪限幅：让目标点"等一等"飞机（照抄 PX4 的 MPC_XY_ERR_MAX）
+			// ===================================================================
+			// PX4 自己生成轨迹时有一模一样的机制（PositionSmoothing.cpp:295-320），
+			// 参数就是 MPC_XY_ERR_MAX（默认 2.0 m）。这里**直接复用那个值**，口径也一致：
+			//
+			//   误差   = 飞机到目标点的 **2D 距离**（横向纵向都算）
+			//   缩放   = 1 - 误差/上限    误差 0 -> 1（不限）；误差 >= 上限 -> 0（停住等）
+			//   方向判据：只有"目标点正在朝远离飞机的方向走"时才限速。
+			//             飞机已经在目标点前面（along_err < 0）时完全不限 ——
+			//             那时候限速只会让它更超前，帮倒忙。
+			//
+			// ⚠ 缩放**只作用在这一拍的输出**，绝不能写回 _ramp_speed：
+			// 写回去会把限幅反馈进加速斜坡（乘系数 s 的稳态是 a·dt·s/(1-s)，
+			// s=0.8 时只有 0.08 m/s，斜坡永远起不来，而且改 MYM_FWD_SPD 完全没用）。
+			const float err_x = _target(0) - pos.x;
+			const float err_y = _target(1) - pos.y;
+			const float track_err = sqrtf(err_x * err_x + err_y * err_y);
+			const float along_err = err_x * ux_dir + err_y * uy_dir;   // 误差在前进方向上的投影
+
+			float track_scale = 1.f;
+
+			if ((_mpc_xy_err_max > FLT_EPSILON) && (along_err >= 0.f)) {
+				track_scale = 1.f - math::constrain(track_err / _mpc_xy_err_max, 0.f, 1.f);
+			}
+
+			// 这一拍**真正推进 _target、并且发给 PX4** 的前馈速度。
+			// 两者用同一个数，前馈才严格等于"目标点实际移动的速度"。
+			const float ff_speed = setpoint_speed * track_scale;
 
 			matrix::Vector2f ff_velocity{NAN, NAN};   // 前馈速度矢量（NED 北/东），发出去的就是它
 			bool sp_at_goal = false;   // 这一拍 setpoint 是否已经贴在终点上
@@ -685,7 +732,7 @@ void MyMission::Run()
 				ff_velocity(1) = 0.f;
 				sp_at_goal = true;
 
-			} else if (dist <= setpoint_speed * dt) {
+			} else if (dist <= ff_speed * dt) {
 				// 这一拍就能走到头。前馈必须按**实际位移/dt** 算，不能按 setpoint_speed ——
 				// 否则 setpoint 只挪了一点点，却让飞机按满速飞，最后一拍就冲过头了。
 				ff_velocity(0) = dx / dt;
@@ -696,30 +743,14 @@ void MyMission::Run()
 				sp_at_goal = true;
 
 			} else {
-				// 前馈速度矢量：方向 = 目标点前进方向，大小 = setpoint_speed。
-				// 然后 _target 就按**同一个速度**往前一步 —— 所以发出去的 velocity 严格
-				// 等于"目标点实际移动的速度"，位置环把它和 P 项相加才不会错配。
-				ff_velocity(0) = ux_dir * setpoint_speed;
-				ff_velocity(1) = uy_dir * setpoint_speed;
+				// 方向 = 目标点前进方向，大小 = ff_speed（已含跟踪限幅）。
+				ff_velocity(0) = ux_dir * ff_speed;
+				ff_velocity(1) = uy_dir * ff_speed;
 				_target(0) += ff_velocity(0) * dt;
 				_target(1) += ff_velocity(1) * dt;
 			}
 
 			publishTrajectorySetpoint(now, NAN, ff_velocity);
-
-			if (now - _last_track_log > kTrackLogInterval) {
-				_last_track_log = now;
-
-				const float ex = _target(0) - pos.x;
-				const float ey = _target(1) - pos.y;
-				const float track_dist = sqrtf(ex * ex + ey * ey);
-				const float along = ex * ux_dir + ey * uy_dir;          // 纵向
-				const float cross = ex * (-uy_dir) + ey * ux_dir;       // 侧向（左正右负）
-
-				PX4_INFO("my_mission: track |d|=%.2f m (along %.2f, cross %.2f)  sp %.2f m/s  v %.2f m/s",
-					 (double)track_dist, (double)along, (double)cross,
-					 (double)setpoint_speed, (double)sqrtf(pos.vx * pos.vx + pos.vy * pos.vy));
-			}
 
 			const matrix::Vector3f v(pos.vx, pos.vy, pos.vz);
 

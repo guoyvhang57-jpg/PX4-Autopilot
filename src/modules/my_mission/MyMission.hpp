@@ -157,19 +157,27 @@ private:
 	// 两者分开的意义：以前是把目标一次性跳到终点（阶跃 -> 位置环瞬间要最大速度 ->
 	// 姿态猛压）；现在终点和"正在走的中间点"分开，保证任意时刻的速度都可控。
 	//
-	// 两个速度量：
+	// 三个速度量，别混：
 	//   _ramp_speed      目标点**上一拍**的移动速度，状态量，只给下一拍的加速限幅用
-	//   setpoint_speed   目标点**这一拍**的移动速度 = 这一拍发给 PX4 的前馈速度
-	//                    （两者必须是同一个数，原因见 Run() 里 FORWARD 分支的注释）
+	//   setpoint_speed   梯形曲线给出的速度（只看目标点离终点多远，**不看飞机在哪**）
+	//   ff_speed         这一拍**真正推进 _target 并发给 PX4** 的前馈速度
+	//                    = setpoint_speed × track_scale（跟踪限幅）
+	//
+	// ⚠ ff_speed 只能用在"推进 _target / 发 velocity"上，**绝不能写回 _ramp_speed**。
+	// 写回去会把限幅反馈进加速斜坡（乘系数 s 的稳态是 a·dt·s/(1-s)，s=0.8 时只有
+	// 0.08 m/s，斜坡永远起不来）。详见 Run() 里 FORWARD 分支的注释。
 	matrix::Vector2f _fwd_goal{};       ///< FORWARD 的终点（xy，NED），进 FORWARD 时定死
 	float _ramp_speed{0.f};             ///< 目标点上一拍的移动速度（m/s），下一拍做加速限幅用
-	hrt_abstime _last_track_log{0};     ///< 上次打"目标点 vs 飞机距离"的时刻（仅监控）
 
 	// ---- 接管安全（油门回中检测）----	// 用 param_find 而不是 DEFINE_PARAMETERS：MAN_DEADZONE 归 manual_control 管，
 	// 这里只是"读它来和 PX4 的油门中位判据保持一致"，不想把它拉进本模块的参数表。
 	param_t _param_man_deadzone{PARAM_INVALID};
 	float _man_deadzone{0.1f};          ///< 缓存的 MAN_DEADZONE，决定"算不算在中位"
 	param_t _param_lndmc_z_vel_max{PARAM_INVALID};
+	// MPC_XY_ERR_MAX：复用 PX4 轨迹生成器的"允许最大水平跟踪误差"做跟踪限幅。
+	// 同样是"和 PX4 行为对齐"的外部阈值，所以也用 param_find 读，不进本模块参数表。
+	param_t _param_mpc_xy_err_max{PARAM_INVALID};
+	float _mpc_xy_err_max{2.0f};        ///< 缓存的 MPC_XY_ERR_MAX（默认 2.0 m），0 = 关掉限幅
 	float _in_descend_min_vel{0.275f};  ///< 1.1 * LNDMC_Z_VEL_MAX：land detector 认"被指令下降"的最低速度
 	bool _desc_rate_warned{false};      ///< MYM_DESC_RATE 被抬高过只告警一次
 	bool _takeover_warned{false};       ///< 离开 Offboard 的告警只发一次，回 WAIT 时复位
