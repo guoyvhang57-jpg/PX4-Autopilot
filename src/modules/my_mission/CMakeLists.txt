@@ -41,5 +41,6 @@ px4_add_module(
 		my_mission_params.yaml
 	DEPENDS
 		mathlib
+		motion_planning
 		px4_work_queue
 )

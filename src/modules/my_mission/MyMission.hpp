@@ -22,6 +22,8 @@
 
 #include <math.h>
 
+#include <motion_planning/PositionSmoothing.hpp>
+
 #include <matrix/matrix/math.hpp>
 
 #include <px4_platform_common/defines.h>
@@ -103,7 +105,7 @@ private:
 	enum class State {
 		Wait,     ///< 等 armed + Offboard + 位置有效；setpoint 钉在当前位置
 		Takeoff,  ///< 目标 = 地面参考上方 MYM_ALT，等位置/速度都到位
-		Forward,  ///< 把 setpoint 以 MYM_FWD_SPD 推到前方点（MYM_FWD_ACC 限加減速）；仅 DIST>0 时进
+		Forward,  ///< 交给 PositionSmoothing 生成轨迹飞到前方点（S 曲线 + 加速度前馈）；仅 DIST>0 时进
 		Hover,    ///< 保持同一 setpoint MYM_HOVER 秒
 		Land,     ///< 方式 1：发 NAV_LAND 交 AUTO_LAND；方式 0：自己把 z 斜坡拉回地面
 		Disarm,   ///< 发 COMPONENT_ARM_DISARM(param1=0)，1 Hz 重试直到 !armed
@@ -114,17 +116,27 @@ private:
 
 	// ---- 发布：offboard 的三条 topic ----
 	void publishOffboardControlMode(hrt_abstime now);   // 每拍都发，问"交给哪一级"
-	// z_velocity：可选的"下降速度前馈"。PositionControl 是 P-位置环 + 速度前馈
-	// （两者相加，不冲突），而 land detector 靠它判断"是否被指令下降"，所以
-	// 自己下降时**必须**给，否则 landed 永远上不去。NED，向下为正。
+	// 四个可选覆盖量，不填就退回默认行为（位置=_target、速度/加速度=NaN=不控制）：
 	//
-	// xy_velocity：可选的"水平速度前馈"，只有 FORWARD 的斜坡用（其余状态给默认
-	// NaN = 不控制，让位置环自己去算）。给它的意义：位置环的结构是
-	// vel_sp = 速度前馈 + MPC_XY_P * 位置误差，前馈给成"setpoint 正在移动的速度"
-	// 之后位置误差≈0，飞机就精确跟着 setpoint 走，不会因为追不上而滞后/超调。
-	// 只写 velocity[0..1]，不碰 velocity[2]，所以和 land detector 无关。
+	// z_velocity：向下速度前馈。PositionControl 是 P-位置环 + 速度前馈（两者相加，
+	// 不冲突），而 land detector 靠它判断"是否被指令下降"，所以自己下降时**必须**给，
+	// 否则 landed 永远上不去。NED，向下为正。
+	//
+	// xy_velocity：水平速度前馈，给"setpoint 正在移动的速度"能让位置误差≈0。
+	// 只写 velocity[0..1]，**不碰 velocity[2]**，所以和 land detector 无关。
+	//
+	// position_override：FORWARD/HOVER 里由 PositionSmoothing 生成的完整位置轨迹。
+	// 给有限值就覆盖 _target —— 这是路线 B 的核心：位置参考不再由本模块逐拍积分，
+	// 而是交给 PX4 自己的轨迹生成器（含 S 曲线 + 保证停在终点）。
+	//
+	// acceleration：**加速度前馈**，也是路线 B 的关键。PositionControl 把它直接加进
+	// 加速度指令（PositionControl.cpp:106 取值、:153 与速度环输出相加），所以它不经过
+	// 速度环那个一阶滞后（τ = 1/MPC_XY_VEL_P_ACC ≈ 0.56 s）。少了它，参考做匀速减速时
+	// 飞机会一直比参考快 a·τ（实测 0.60 m/s），到终点前就已经冲过去了。
 	void publishTrajectorySetpoint(hrt_abstime now, float z_velocity = NAN,
-				       const matrix::Vector2f &xy_velocity = matrix::Vector2f(NAN, NAN));
+				       const matrix::Vector2f &xy_velocity = matrix::Vector2f(NAN, NAN),
+				       const matrix::Vector3f &position_override = matrix::Vector3f(NAN, NAN, NAN),
+				       const matrix::Vector3f &acceleration = matrix::Vector3f(NAN, NAN, NAN));
 	void publishVehicleCommand(uint16_t command, float param1 = 0.f, float param2 = 0.f);
 
 	// ---- 状态判断 / 工具 ----
@@ -152,32 +164,48 @@ private:
 	float _yaw_sp{0.f};                 ///< 锁存的航向，每拍原样发给 trajectory_setpoint.yaw
 	float _takeoff_yaw{0.f};            ///< 起飞那一刻的航向，Forward 用它算"机头正前方"
 
-	// ---- FORWARD 的位置斜坡（xy 两轴）----
-	// _target 是"这一拍真正发出去的目标位置"，FORWARD 里它每拍朝 _fwd_goal 挪 ff_velocity*dt。
-	// 两者分开的意义：以前是把目标一次性跳到终点（阶跃 -> 位置环瞬间要最大速度 ->
-	// 姿态猛压）；现在终点和"正在走的中间点"分开，保证任意时刻的速度都可控。
+	// ---- FORWARD 的参考生成：直接复用 PX4 的 PositionSmoothing ----
 	//
-	// 三个速度量，别混：
-	//   _ramp_speed      目标点**上一拍**的移动速度，状态量，只给下一拍的加速限幅用
-	//   setpoint_speed   梯形曲线给出的速度（只看目标点离终点多远，**不看飞机在哪**）
-	//   ff_speed         这一拍**真正推进 _target 并发给 PX4** 的前馈速度
-	//                    = setpoint_speed × track_scale（跟踪限幅）
+	// 为什么不再自己写斜坡：原来的做法是逐拍把 _target 朝终点推，速度曲线上
+	// 只有"加速限幅 / 巡航上限 / 刹车限幅 sqrt(2ad)"三个约束，**没有加速度前馈**。
+	// 结果参考做匀速减速时，飞机永远比参考快 a·τ（τ = 1/MPC_XY_VEL_P_ACC ≈ 0.56 s），
+	// 实测 gz_towed 上 3 m 前进段稳定过冲 0.39~0.45 m，7 次复现。
 	//
-	// ⚠ ff_speed 只能用在"推进 _target / 发 velocity"上，**绝不能写回 _ramp_speed**。
-	// 写回去会把限幅反馈进加速斜坡（乘系数 s 的稳态是 a·dt·s/(1-s)，s=0.8 时只有
-	// 0.08 m/s，斜坡永远起不来）。详见 Run() 里 FORWARD 分支的注释。
+	// 现在交给 PositionSmoothing（和 GotoControl 用的是同一套，见 GotoControl.cpp:100）：
+	//   * 每拍先按上一拍解出的三段时长推进轨迹，再以新状态为起点重解一次
+	//   * 位置/速度/加速度/jerk 全部解析求得，终点速度、加速度严格为零
+	//   * 刹车速度上限由 computeMaxSpeedFromDistance 给（TrajMath.hpp:61-71），
+	//     它**扣掉了 jerk 建立减速度期间的滑行距离**，比 sqrt(2ad) 保守
+	//   * 输出的 acceleration 直接当加速度前馈发出去（这是修掉过冲的关键）
+	//
+	// 限制的映射原则：**能用 MYM_ 参数的就用 MYM_，气动/机体限制用 PX4 的**。
+	// 速度上限 = MYM_FWD_SPD，加速度上限 = MYM_FWD_ACC，jerk/绝对速度上限/
+	// 跟踪误差上限分别取 MPC_JERK_AUTO / MPC_XY_VEL_MAX / MPC_XY_ERR_MAX
+	// （和 GotoControl.hpp:99-102 的口径完全一致）。
+	PositionSmoothing _pos_smoothing;
 	matrix::Vector2f _fwd_goal{};       ///< FORWARD 的终点（xy，NED），进 FORWARD 时定死
-	float _ramp_speed{0.f};             ///< 目标点上一拍的移动速度（m/s），下一拍做加速限幅用
+	matrix::Vector3f _fwd_goal3{};      ///< 同上，三维（z = 平飞高度），喂给平滑器
+	hrt_abstime _last_run{0};           ///< 上一拍的时刻，用来算真实的 dt（平滑器靠 dt 推进）
 
 	// ---- 接管安全（油门回中检测）----	// 用 param_find 而不是 DEFINE_PARAMETERS：MAN_DEADZONE 归 manual_control 管，
 	// 这里只是"读它来和 PX4 的油门中位判据保持一致"，不想把它拉进本模块的参数表。
 	param_t _param_man_deadzone{PARAM_INVALID};
 	float _man_deadzone{0.1f};          ///< 缓存的 MAN_DEADZONE，决定"算不算在中位"
 	param_t _param_lndmc_z_vel_max{PARAM_INVALID};
-	// MPC_XY_ERR_MAX：复用 PX4 轨迹生成器的"允许最大水平跟踪误差"做跟踪限幅。
-	// 同样是"和 PX4 行为对齐"的外部阈值，所以也用 param_find 读，不进本模块参数表。
+	// 下面这几个同理：都是"和 PX4 行为对齐"的外部阈值，用 param_find 读，
+	// 不进本模块参数表。设错不会崩，最多是平滑器的手感和机体限制不一致。
 	param_t _param_mpc_xy_err_max{PARAM_INVALID};
-	float _mpc_xy_err_max{2.0f};        ///< 缓存的 MPC_XY_ERR_MAX（默认 2.0 m），0 = 关掉限幅
+	float _mpc_xy_err_max{2.0f};        ///< MPC_XY_ERR_MAX（默认 2.0 m）→ 平滑器的水平跟踪误差上限
+	param_t _param_mpc_z_err_max{PARAM_INVALID};
+	float _mpc_z_err_max{1.0f};         ///< MPC_Z_ERR_MAX（默认 1.0 m）→ 竖直跟踪误差上限
+	param_t _param_mpc_jerk_auto{PARAM_INVALID};
+	float _mpc_jerk_auto{4.0f};         ///< MPC_JERK_AUTO（默认 4.0 m/s³）→ 平滑器的 jerk 上限
+	param_t _param_mpc_xy_vel_max{PARAM_INVALID};
+	float _mpc_xy_vel_max{12.0f};       ///< MPC_XY_VEL_MAX（默认 12 m/s）→ 平滑器的绝对速度天花板
+	param_t _param_mpc_z_v_auto_up{PARAM_INVALID};
+	float _mpc_z_v_auto_up{3.0f};       ///< MPC_Z_V_AUTO_UP（默认 3.0 m/s）→ 平滑器的上升速度上限
+	param_t _param_mpc_acc_up_max{PARAM_INVALID};
+	float _mpc_acc_up_max{4.0f};        ///< MPC_ACC_UP_MAX（默认 4.0 m/s²）→ 平滑器的上升加速度上限
 	float _in_descend_min_vel{0.275f};  ///< 1.1 * LNDMC_Z_VEL_MAX：land detector 认"被指令下降"的最低速度
 	bool _desc_rate_warned{false};      ///< MYM_DESC_RATE 被抬高过只告警一次
 	bool _takeover_warned{false};       ///< 离开 Offboard 的告警只发一次，回 WAIT 时复位

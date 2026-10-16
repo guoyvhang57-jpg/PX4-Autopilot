@@ -260,7 +260,8 @@ void MyMission::publishOffboardControlMode(hrt_abstime now)
 	_ocm_pub.publish(ocm);
 }
 
-void MyMission::publishTrajectorySetpoint(hrt_abstime now, float z_velocity, const matrix::Vector2f &xy_velocity)
+void MyMission::publishTrajectorySetpoint(hrt_abstime now, float z_velocity, const matrix::Vector2f &xy_velocity,
+		const matrix::Vector3f &position_override, const matrix::Vector3f &acceleration)
 {
 	// ===================================================================
 	// 只在真正处于 Offboard 时才发 —— 这不是优化，是正确性要求
@@ -291,7 +292,15 @@ void MyMission::publishTrajectorySetpoint(hrt_abstime now, float z_velocity, con
 	tsp.timestamp = now;
 
 	// ---- 位置（NED，向上为负）----
-	if (_target_valid) {
+	// 优先用覆盖值：FORWARD 里那是 PositionSmoothing 生成的完整三维轨迹。
+	// 它一定有效（平滑器内部有状态，而且进 FORWARD 前已经确认过位置估计可用），
+	// 所以不走 _target_valid 那个分支。
+	if (PX4_ISFINITE(position_override(0))) {
+		tsp.position[0] = position_override(0);
+		tsp.position[1] = position_override(1);
+		tsp.position[2] = position_override(2);
+
+	} else if (_target_valid) {
 		tsp.position[0] = _target(0);
 		tsp.position[1] = _target(1);
 		tsp.position[2] = _target(2);
@@ -311,6 +320,17 @@ void MyMission::publishTrajectorySetpoint(hrt_abstime now, float z_velocity, con
 		tsp.velocity[i] = NAN;
 		tsp.acceleration[i] = NAN;
 		tsp.jerk[i] = NAN;
+	}
+
+	// ---- 加速度前馈（只有平滑器给）----
+	// 这是修掉末端过冲的关键一项。PositionControl 把它**直接**放进加速度指令
+	// （PositionControl.cpp:106 取值、:153 与速度环输出相加），不经过速度环的
+	// 一阶滞后（τ = 1/MPC_XY_VEL_P_ACC ≈ 0.56 s）。没有它，参考做匀速减速时
+	// 飞机会一直比参考快 a·τ，到终点时已经冲过去了。
+	for (int i = 0; i < 3; i++) {
+		if (PX4_ISFINITE(acceleration(i))) {
+			tsp.acceleration[i] = acceleration(i);
+		}
 	}
 
 	// ---- 可选的水平速度前馈（只有 FORWARD 的斜坡用）----
@@ -419,20 +439,37 @@ void MyMission::updateExternalParams()
 		_in_descend_min_vel = 1.1f * lndmc_z_vel_max;
 	}
 
-	// MPC_XY_ERR_MAX：PX4 自己轨迹生成器的"允许的最大水平跟踪误差"，
-	// **本模块直接复用这个值**，不另造一个 MYM_ 参数。理由：
-	//   1) 它的语义就是"目标点落后飞机不能超过多少"，正对上 FORWARD 斜坡要做的事；
-	//   2) PX4 默认已经调到 2.0 m，是验证过的值，自己再发明一个数字没有依据；
-	//   3) 和上面 LNDMC_Z_VEL_MAX 同一个套路 —— 需要和 PX4 行为对齐的阈值就抄 PX4 的。
-	// 用法见 FORWARD 分支里的"跟踪限幅"，口径也和 PX4 一致（2D 距离 + 方向判据）。
-	if (_param_mpc_xy_err_max == PARAM_INVALID) {
-		_param_mpc_xy_err_max = param_find("MPC_XY_ERR_MAX");
-	}
+	// MPC_XY_ERR_MAX / MPC_Z_ERR_MAX / MPC_JERK_AUTO / MPC_XY_VEL_MAX /
+	// MPC_Z_V_AUTO_UP / MPC_ACC_UP_MAX：这几个都是喂给 PositionSmoothing 的限制，
+	// **直接复用 PX4 自己的参数**，不另造 MYM_ 参数。理由：
+	//   1) 语义完全一致 —— GotoControl 就是这么喂的（GotoControl.hpp:99-102）；
+	//   2) PX4 默认值都是调过的，自己再发明一套没有依据；
+	//   3) 和 LNDMC_Z_VEL_MAX 同一个套路：要和 PX4 行为对齐的阈值就抄 PX4 的。
+	// MYM_FWD_SPD / MYM_FWD_ACC 不在这里读 —— 它们是本模块自己的参数，
+	// 在 FORWARD 入口直接取（见 Run()）。
+	struct {
+		const char *name;
+		param_t *handle;
+		float *value;
+	} externals[] = {
+		{"MPC_XY_ERR_MAX",  &_param_mpc_xy_err_max,  &_mpc_xy_err_max},
+		{"MPC_Z_ERR_MAX",   &_param_mpc_z_err_max,   &_mpc_z_err_max},
+		{"MPC_JERK_AUTO",   &_param_mpc_jerk_auto,   &_mpc_jerk_auto},
+		{"MPC_XY_VEL_MAX",  &_param_mpc_xy_vel_max,  &_mpc_xy_vel_max},
+		{"MPC_Z_V_AUTO_UP", &_param_mpc_z_v_auto_up, &_mpc_z_v_auto_up},
+		{"MPC_ACC_UP_MAX",  &_param_mpc_acc_up_max,  &_mpc_acc_up_max},
+	};
 
-	float xy_err_max = _mpc_xy_err_max;
+	for (auto &ext : externals) {
+		if (*(ext.handle) == PARAM_INVALID) {
+			*(ext.handle) = param_find(ext.name);
+		}
 
-	if ((_param_mpc_xy_err_max != PARAM_INVALID) && (param_get(_param_mpc_xy_err_max, &xy_err_max) == PX4_OK)) {
-		_mpc_xy_err_max = xy_err_max;
+		float value = *(ext.value);
+
+		if ((*(ext.handle) != PARAM_INVALID) && (param_get(*(ext.handle), &value) == PX4_OK)) {
+			*(ext.value) = value;
+		}
 	}
 }
 
@@ -500,7 +537,16 @@ void MyMission::Run()
 	}
 
 	const hrt_abstime now = hrt_absolute_time();
-	const float dt = 0.02f;   // 必须和 init() 里的 20_ms 一致：下降斜坡靠它积分
+
+	// dt 用实测时间差，不再写死 0.02。两个理由：
+	//   1) PositionSmoothing 靠它推进轨迹（内部是 `_local_time += dt * stretch`），
+	//      dt 不准会让轨迹的"时间"和"几何"对不上。PX4 自己也这么做，而且同样把
+	//      结果夹在 2~40 ms 之间（MulticopterPositionControl.cpp:391-392）——
+	//      上界防一次卡顿把轨迹推飞，下界防除零。
+	//   2) 方式 0 的下降斜坡也靠它积分，调度抖动会让下降速率偏。
+	const float dt = (_last_run == 0) ? 0.02f
+			 : math::constrain((now - _last_run) * 1e-6f, 0.002f, 0.04f);
+	_last_run = now;
 
 	// 参数在线更新：QGC 或命令行改完 MYM_* 立即生效，不用重启模块、更不用重编。
 	if (_parameter_update_sub.updated()) {
@@ -619,15 +665,44 @@ void MyMission::Run()
 				_fwd_goal(1) = _target(1) + fwd_dist * sinf(psi);
 
 				// z 不动：先在 MYM_ALT 上平飞过去，到了再降。
-				_state = State::Forward;
-				_state_start = now;
-				_ramp_speed = 0.f;   // 斜坡从 0 速起步
+				// 三维终点给平滑器；xy 那两维给本模块自己留着（print_status 和日志用）。
+				_fwd_goal3 = matrix::Vector3f(_fwd_goal(0), _fwd_goal(1), _target(2));
 
-				// 按 MYM_FWD_SPD / MYM_FWD_ACC 估算这条梯形曲线要走多久，
-				// 和 MYM_FWD_TMO 对一下 —— 斜坡比阶跃慢得多，超时参数不跟着改会
-				// 变成"还没飞到就被判超时去降落"。
+				// ===========================================================
+				// 交给 PositionSmoothing（和 GotoControl 用的是同一套）
+				// ===========================================================
+				// 先设限制。**每次进 FORWARD 都设一遍**：代价只是几个赋值，
+				// 换来的是运行中改 MYM_* / MPC_* 立刻生效，不用重启模块。
+				//
+				// 速度/加速度用本模块的 MYM_，其余用 PX4 的 —— 口径和
+				// GotoControl.hpp:99-102 一致。注意 setCruiseSpeed 是**速度规划的
+				// 上限**（_getMaxXYSpeed 里的 config.max_speed_xy），忘设的症状是
+				// "速度永远上不去"，而加速度和 jerk 看起来都正常，很容易误判。
 				const float spd = math::max(_param_mym_fwd_spd.get(), 0.01f);
 				const float acc = math::max(_param_mym_fwd_acc.get(), 0.05f);
+
+				_pos_smoothing.setCruiseSpeed(spd);
+				_pos_smoothing.setMaxAccelerationXY(acc);
+				_pos_smoothing.setMaxVelocityXY(math::max(_mpc_xy_vel_max, spd));
+				_pos_smoothing.setMaxJerk(math::max(_mpc_jerk_auto, 0.1f));
+				_pos_smoothing.setMaxAllowedHorizontalError(math::max(_mpc_xy_err_max, 0.f));
+				_pos_smoothing.setMaxAllowedVerticalError(math::max(_mpc_z_err_max, 0.f));
+				_pos_smoothing.setMaxVelocityZ(math::max(_mpc_z_v_auto_up, 0.1f));
+				_pos_smoothing.setMaxAccelerationZ(math::max(_mpc_acc_up_max, 0.1f));
+
+				// 用飞机**当前的三阶状态**点亮平滑器：位置、速度、加速度。
+				// 给加速度是关键 —— 轨迹的加速度从飞机此刻的加速度出发，
+				// 任何一个阶次上都不出现跳变。GotoControl.cpp:71-75 是同样的做法。
+				_pos_smoothing.reset(matrix::Vector3f(pos.ax, pos.ay, pos.az),
+						     matrix::Vector3f(pos.vx, pos.vy, pos.vz),
+						     matrix::Vector3f(pos.x, pos.y, pos.z));
+
+				_state = State::Forward;
+				_state_start = now;
+
+				// 按 MYM_FWD_SPD / MYM_FWD_ACC 估算"理想梯形曲线"要走多久，和
+				// MYM_FWD_TMO 对一下。真实轨迹因为 jerk 受限会更慢一点，
+				// 所以这是个乐观下界 —— 拿它当提醒够用。
 				const float d_ramp = spd * spd / acc;   // 加速段 + 减速段一共走的距离
 				const float t_est = (fwd_dist > d_ramp)
 						    ? (2.f * spd / acc + (fwd_dist - d_ramp) / spd)
@@ -636,8 +711,8 @@ void MyMission::Run()
 				PX4_INFO("my_mission: FORWARD %.2f m at %.0f deg (heading %.0f deg) -> target [%.2f %.2f]",
 					 (double)fwd_dist, (double)_param_mym_fwd_dir.get(),
 					 (double)math::degrees(_takeoff_yaw), (double)_fwd_goal(0), (double)_fwd_goal(1));
-				PX4_INFO("my_mission: ramp %.2f m/s acc %.2f m/s^2, est %.1f s (tilt ~%.0f deg)",
-					 (double)spd, (double)acc, (double)t_est,
+				PX4_INFO("my_mission: smoother cruise %.2f m/s acc %.2f m/s^2 jerk %.2f, est %.1f s (tilt ~%.0f deg)",
+					 (double)spd, (double)acc, (double)_mpc_jerk_auto, (double)t_est,
 					 (double)math::degrees(atanf(acc / CONSTANTS_ONE_G)));
 
 				if (t_est > _param_mym_fwd_tmo.get()) {
@@ -664,110 +739,64 @@ void MyMission::Run()
 		break;
 
 	case State::Forward: {
-
-			const float spd = math::max(_param_mym_fwd_spd.get(), 0.01f);
-			const float acc = math::max(_param_mym_fwd_acc.get(), 0.05f);
-
-			const float dx = _fwd_goal(0) - _target(0);
-			const float dy = _fwd_goal(1) - _target(1);
-			const float dist = sqrtf(dx * dx + dy * dy);
-
-			// 前进方向单位向量（_target → 终点）。dist 可能是 0，先挡住再除。
-			const float ux_dir = (dist > 1e-3f) ? (dx / dist) : 0.f;
-			const float uy_dir = (dist > 1e-3f) ? (dy / dist) : 0.f;
-
-			// ===================================================================
-			// 速度曲线：目标点每拍该往前挪多快
-			// ===================================================================
-			// 只看 setpoint 到终点的距离，**完全不看飞机在哪**：
-			//   加速限幅  _ramp_speed + acc*dt   这一拍最多比上一拍快这么多
-			//   巡航上限  spd                     MYM_FWD_SPD
-			//   刹车限幅  sqrt(2*acc*dist)        还能正好刹停在终点的最高速度（v²=2as 反解）
-			// 取三者最小，自动形成"加速-匀速-减速"。近处第三项更小，整个曲线退化成三角形。
+			// ===========================================================
+			// 让 PX4 自己的轨迹生成器算这一拍该发什么
+			// ===========================================================
+			// 输入：飞机的**真实位置**（不是上一次的 setpoint）+ 三维终点。
+			// 外部前馈速度给 0 —— 本模块没有别的参考源，参考完全由平滑器生成。
+			// force_zero_velocity_setpoint = false：正常生成轨迹，不是"要求立刻停住"。
 			//
-			// _ramp_speed 是**上一拍**的曲线速度，只给这里的加速限幅用。
-			float setpoint_speed = math::min(spd, _ramp_speed + acc * dt);
-			setpoint_speed = math::min(setpoint_speed, sqrtf(2.f * acc * dist));
-			_ramp_speed = setpoint_speed;
+			// 平滑器每拍做三件事（PositionSmoothing.cpp:285-350）：
+			//   1) 把"位置目标"换算成"速度目标"（速度上限由剩余距离反解，见 TrajMath.hpp）
+			//   2) 用上一拍解出的三段时长，从**上一拍记录的状态**推进 dt
+			//   3) 以推进后的状态为新起点，重解一次三段时长
+			// 第 2 步从记录状态求值而不是增量累加，是它不漂的原因。
+			PositionSmoothing::PositionSmoothingSetpoints sp;
+			_pos_smoothing.generateSetpoints(matrix::Vector3f(pos.x, pos.y, pos.z),
+							 _fwd_goal3,
+							 matrix::Vector3f(),
+							 dt, false, sp);
 
-			// ===================================================================
-			// 跟踪限幅：让目标点"等一等"飞机（照抄 PX4 的 MPC_XY_ERR_MAX）
-			// ===================================================================
-			// PX4 自己生成轨迹时有一模一样的机制（PositionSmoothing.cpp:295-320），
-			// 参数就是 MPC_XY_ERR_MAX（默认 2.0 m）。这里**直接复用那个值**，口径也一致：
-			//
-			//   误差   = 飞机到目标点的 **2D 距离**（横向纵向都算）
-			//   缩放   = 1 - 误差/上限    误差 0 -> 1（不限）；误差 >= 上限 -> 0（停住等）
-			//   方向判据：只有"目标点正在朝远离飞机的方向走"时才限速。
-			//             飞机已经在目标点前面（along_err < 0）时完全不限 ——
-			//             那时候限速只会让它更超前，帮倒忙。
-			//
-			// ⚠ 缩放**只作用在这一拍的输出**，绝不能写回 _ramp_speed：
-			// 写回去会把限幅反馈进加速斜坡（乘系数 s 的稳态是 a·dt·s/(1-s)，
-			// s=0.8 时只有 0.08 m/s，斜坡永远起不来，而且改 MYM_FWD_SPD 完全没用）。
-			const float err_x = _target(0) - pos.x;
-			const float err_y = _target(1) - pos.y;
-			const float track_err = sqrtf(err_x * err_x + err_y * err_y);
-			const float along_err = err_x * ux_dir + err_y * uy_dir;   // 误差在前进方向上的投影
+			// 位置、速度、**加速度**三个量一起发 —— 加速度这一项就是修掉末端过冲的关键：
+			// PositionControl.cpp:153 把它直接加进加速度指令，绕过了速度环那个
+			// τ ≈ 0.56 s 的一阶滞后。没有它，参考做匀速减速时飞机永远比参考快 a·τ，
+			// 到终点时早就冲过去了（实测 0.39~0.45 m）。
+			publishTrajectorySetpoint(now, NAN, matrix::Vector2f(sp.velocity(0), sp.velocity(1)),
+						  sp.position, sp.acceleration);
 
-			float track_scale = 1.f;
+			// 让 HOVER / LAND / print_status 接着用同一个位置
+			_target = sp.position;
 
-			if ((_mpc_xy_err_max > FLT_EPSILON) && (along_err >= 0.f)) {
-				track_scale = 1.f - math::constrain(track_err / _mpc_xy_err_max, 0.f, 1.f);
-			}
-
-			// 这一拍**真正推进 _target、并且发给 PX4** 的前馈速度。
-			// 两者用同一个数，前馈才严格等于"目标点实际移动的速度"。
-			const float ff_speed = setpoint_speed * track_scale;
-
-			matrix::Vector2f ff_velocity{NAN, NAN};   // 前馈速度矢量（NED 北/东），发出去的就是它
-			bool sp_at_goal = false;   // 这一拍 setpoint 是否已经贴在终点上
-
-			if (dist < 1e-3f) {
-				// 已经贴住终点：setpoint 不动，前馈给 0（明确的"要求停住"）
-				_target(0) = _fwd_goal(0);
-				_target(1) = _fwd_goal(1);
-				_ramp_speed = 0.f;
-				ff_velocity(0) = 0.f;
-				ff_velocity(1) = 0.f;
-				sp_at_goal = true;
-
-			} else if (dist <= ff_speed * dt) {
-				// 这一拍就能走到头。前馈必须按**实际位移/dt** 算，不能按 setpoint_speed ——
-				// 否则 setpoint 只挪了一点点，却让飞机按满速飞，最后一拍就冲过头了。
-				ff_velocity(0) = dx / dt;
-				ff_velocity(1) = dy / dt;
-				_target(0) = _fwd_goal(0);
-				_target(1) = _fwd_goal(1);
-				_ramp_speed = 0.f;
-				sp_at_goal = true;
-
-			} else {
-				// 方向 = 目标点前进方向，大小 = ff_speed（已含跟踪限幅）。
-				ff_velocity(0) = ux_dir * ff_speed;
-				ff_velocity(1) = uy_dir * ff_speed;
-				_target(0) += ff_velocity(0) * dt;
-				_target(1) += ff_velocity(1) * dt;
-			}
-
-			publishTrajectorySetpoint(now, NAN, ff_velocity);
-
+			// ===========================================================
+			// 到位判据
+			// ===========================================================
+			// 两件事都满足才算到：
+			//   1) **轨迹**已经贴住终点。平滑器的速度上限是按剩余距离反解的，
+			//      所以"位置到终点"和"速度归零"本来就是同一件事（TrajMath.hpp:61-71）。
+			//   2) **飞机**的速度也小。轨迹到了不等于飞机到了，中间还有跟踪误差。
+			// 位置口径用 MYM_ARRIVE（默认 0.20 m），比 PX4 任务航点的 NAV_ACC_RAD
+			// （10 m）严格得多 —— 我们要的是"停在这个点上"，不是"进圈算过"。
+			const float dist_to_goal = (_fwd_goal3 - sp.position).norm();
 			const matrix::Vector3f v(pos.vx, pos.vy, pos.vz);
 
-			// 到位判据 = "斜坡走完（setpoint 已经等于终点）**且**实际速度接近 0"。
-			// 这里故意不用 reachedTarget() 的位置半径：斜坡每拍都把 setpoint 精确推到
-			// 终点，速度归零本身就意味着到了；而位置半径会被跟踪残差/EKF 漂移拖成
-			// 永远差一点点 -> 走超时。
-			if (sp_at_goal && v.norm() < 0.3f) {
+			if ((dist_to_goal < _param_mym_arrive.get()) && (v.norm() < 0.3f)) {
+				// ⚠ 进 HOVER 之前把 _target **钉到真正的终点**，不要留在平滑器
+				// 最后的位置上。到位判据带 MYM_ARRIVE 的容差（默认 0.2 m），
+				// 而平滑器是渐近收敛的 —— 直接切走会让飞机永久停在离终点
+				// 最多 0.2 m 的地方（实测 0.14 m）。钉到终点之后，HOVER 的
+				// 位置环会把剩下那点走完。
+				_target = _fwd_goal3;
+
 				_state = State::Hover;
 				_state_start = now;
 				PX4_INFO("my_mission: reached forward point [%.2f %.2f], HOVER %.1f s",
-					 (double)_target(0), (double)_target(1), (double)_param_mym_hover.get());
+					 (double)sp.position(0), (double)sp.position(1), (double)_param_mym_hover.get());
 
 			} else if (elapsedSince(_state_start, now) > _param_mym_fwd_tmo.get()) {
-				// 飞不到（航向估计歪 / 顶风 / EKF 位置漂 / 速度给得太小）→ 不再硬追，
+				// 飞不到（航向估计歪 / 顶风 / EKF 位置漂 / 限幅设得太小）→ 不再硬追，
 				// 和起飞超时同样的策略：直接进降落流程，别一直在外面飞。
-				PX4_WARN("my_mission: forward timeout, going to LAND");
+				PX4_WARN("my_mission: forward timeout (traj %.2f m from goal, v %.2f m/s), going to LAND",
+					 (double)dist_to_goal, (double)v.norm());
 				_state = State::Land;
 				_state_start = now;
 				_land_cmd_sent = false;
