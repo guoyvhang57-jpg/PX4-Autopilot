@@ -9,7 +9,7 @@ parameters:
           进入 Offboard 后相对"进入点"（通常是地面）上升多少，单位 m。
           目标位置 = 进入时的位置，z 再减去这个值（NED 向上为负）。
       type: float
-      default: 1.0
+      default: 1.5
       decimal: 2
       min: 0.2
       max: 50.0
