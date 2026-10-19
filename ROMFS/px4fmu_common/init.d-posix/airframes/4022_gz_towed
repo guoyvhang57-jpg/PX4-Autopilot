@@ -25,6 +25,8 @@ param set-default CA_ROTOR_COUNT 6
 
 # 几何：model.sdf 是 FLU(y左正)，CA_ROTORn_PX/PY/PZ 用 FRD(y右正, z下正) => PY = -SDF_y
 # --- 升力旋翼 ---
+# 注：升力桨在 z=0.35187，比重心(0.31003)高 0.04184 m，但这里故意不设 PZ ——
+#     竖直桨的 position x (0,0,-1) 不含 z 分量，PZ 对力矩严格无影响。
 param set-default CA_ROTOR0_PX  0.29898    # 右前 ccw
 param set-default CA_ROTOR0_PY  0.33634
 param set-default CA_ROTOR0_KM  0.025
@@ -40,28 +42,41 @@ param set-default CA_ROTOR3_KM -0.025
 
 # --- 推力电机 ---
 # 推力轴 = link 局部 +z 在机体系(FRD)的分量
-# PZ = -0.283 ：推力线在重心上方 0.283 m，分配器据此自动配平抬头力矩 (0.283*Fx)
+# PZ = 0      ：推力线过重心，前推力不产生俯仰力矩。
+#               model.sdf 里 base_link 的 <inertial><pose> 已抬到 z=0.30764，
+#               使全机重心正好落在推力桨高度 0.31003 —— SDF 里两者 z 相同 => PZ=0。
+#               ⚠ 改 SDF 的重心必须回来同步这一行，否则分配器会按一个虚构的力臂
+#                 去配平俯仰，凭空产生姿态偏差。
+#               改之前重心在 0.0267、推力桨高出 0.283 m（此处原为 -0.283）：那时满推
+#               40.6 N 带出 11.5 N·m **低头**力矩，而升力桨俯仰权限只有
+#               2 x 0.29898 x 21.6 = 12.9 N·m —— 等于吃掉 89%，剩不下控制余量。
 # PY = 0      ：故意不告诉它力臂 —— 否则分配器会优先用它们做偏航（力臂 0.517 vs
 #               升力桨 KM 0.025），造成持续差动、白耗功率，并在机翼上产生非指令滑流。
 #               以后若要用差动偏航，把 PY 改成 ±0.55
 param set-default CA_ROTOR4_PX  0
 param set-default CA_ROTOR4_PY  0
-param set-default CA_ROTOR4_PZ -0.283
+param set-default CA_ROTOR4_PZ  0
 param set-default CA_ROTOR4_AX  0.940
 param set-default CA_ROTOR4_AY  0
 param set-default CA_ROTOR4_AZ -0.342
 param set-default CA_ROTOR4_KM  0
 param set-default CA_ROTOR5_PX  0
 param set-default CA_ROTOR5_PY  0
-param set-default CA_ROTOR5_PZ -0.283
+param set-default CA_ROTOR5_PZ  0
 param set-default CA_ROTOR5_AX  0.940
 param set-default CA_ROTOR5_AY  0
 param set-default CA_ROTOR5_AZ -0.342
 param set-default CA_ROTOR5_KM  0
 
 # ---------------------------------------------------------------------------
-# 让 thrust_body 的单位正好是牛顿（三个参数必须配套）：
-#   CA_ROTORn_CT   = 每桨满推推力 [N]（分配器里 CT 是线性系数）
+# thrust_body 是**无量纲**的，不是牛顿：ControlAllocationPseudoInverse.cpp 会把每个
+# 推力轴按 norm_sum/num_non_zero 归一化成"该方向作动器的平均值，1 = 满量程"。
+# 实测悬停 thrust_body[2]=-0.46 正好解出四个升力桨各 0.46，与 MPC_THR_HOVER 一致。
+# 六个桨 CT 同值时，伪逆的 1/k 和归一化的 1/k 互相抵消 —— CT=21.6 与 CT=1 完全等价，
+# CT 只在各桨取值不同时才改变分配权重。
+#
+# 下面这几个参数配套，是为了让"推力指令 -> 电机指令"这一段线性：
+#   CA_ROTORn_CT   = 每桨满推推力 [N]（线性模型里的系数）
 #   SIM_GZ_EC_MINn = 0                （无怠速偏置，物理推力 = CT * u^2）
 #   THR_MDL_FAC    = 1.0              （输出级把"推力指令"开方成电机指令，正好抵消
 #                                       T ∝ w^2，使分配器的线性模型精确）
