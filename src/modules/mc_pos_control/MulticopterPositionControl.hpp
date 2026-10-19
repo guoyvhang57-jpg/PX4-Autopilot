@@ -190,7 +190,14 @@ private:
 
 		(ParamFloat<px4::params::MPC_XY_ERR_MAX>) _param_mpc_xy_err_max,
 		(ParamFloat<px4::params::MPC_YAWRAUTO_MAX>) _param_mpc_yawrauto_max,
-		(ParamFloat<px4::params::MPC_YAWRAUTO_ACC>) _param_mpc_yawrauto_acc
+		(ParamFloat<px4::params::MPC_YAWRAUTO_ACC>) _param_mpc_yawrauto_acc,
+
+		// Forward-thrust assist: clamp the nose-down pitch and route the force deficit to the
+		// forward-facing thrusters (see PositionControl::setForwardThrust()).
+		(ParamInt<px4::params::MYM_FWD_THR_EN>)   _param_mym_fwd_thr_en,
+		(ParamFloat<px4::params::MYM_PITCH_MIN>)     _param_mym_pitch_min,
+		(ParamFloat<px4::params::MYM_FWD_THR_SC>) _param_mym_fwd_thr_sc,
+		(ParamFloat<px4::params::MYM_FWD_THR_MAX>) _param_mym_fwd_thr_max
 	);
 
 	math::WelfordMean<float> _sample_interval_s{};

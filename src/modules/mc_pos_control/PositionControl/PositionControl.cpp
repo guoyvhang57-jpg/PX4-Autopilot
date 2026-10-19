@@ -215,7 +215,69 @@ void PositionControl::_accelerationControl()
 	}
 
 	Vector3f body_z = Vector3f(-_acc_sp(0), -_acc_sp(1), -z_specific_force).normalized();
+
+	// --- Forward-thrust assist ---------------------------------------------------------------
+	// body_z is the direction of the body z axis in the local frame (it points down when level),
+	// so a nose-down demand gives body_z(0) < 0. If the demanded pitch is steeper than the ceiling
+	// we clamp the attitude there and turn the force deficit into forward thrust for the thrusters.
+	//
+	// The horizontal force of a tilted multirotor is (vertical force) * tan(pitch), so the deficit
+	// is a tan() difference, not the sin() difference used by VtolType::pusher_assist(): the sine
+	// version underestimates the missing force by ~18% at the operating points we care about
+	// (24 deg demand vs 15 deg clamp: tan gives 7.30 N, sin gives 6.05 N).
+	//
+	// Keep the unlimited direction: MPC_TILTMAX_AIR may already have truncated the demand and the
+	// deficit has to be measured against what was actually asked for, not against the truncation.
+	const Vector3f body_z_raw = body_z;
+
 	ControlMath::limitTilt(body_z, Vector3f(0, 0, 1), _lim_tilt);
+
+	_fwd_thrust = 0.f;
+
+	// Effective nose-down ceiling: the tighter of MPC_PITCH_MIN and -MPC_TILTMAX_AIR, so the assist
+	// can never loosen a limit that MPC_TILTMAX_AIR already imposed.
+	const float pitch_ceiling = math::max(_pitch_min, -_lim_tilt);
+
+	if (_fwd_thrust_en && (pitch_ceiling < 0.f) && (body_z_raw.norm_squared() > FLT_EPSILON)) {
+		// _yaw_sp is only sanitised after _velocityControl() returns, so fall back to the state.
+		const float yaw_ref = PX4_ISFINITE(_yaw_sp) ? _yaw_sp : _yaw;
+		const float cy = cosf(yaw_ref);
+		const float sy = sinf(yaw_ref);
+
+		// Rotate into the heading frame: the x component is the along-heading (pitch) part
+		const float x_h = cy * body_z_raw(0) + sy * body_z_raw(1);   // along the heading
+		const float z_h = body_z_raw(2);                             // downwards
+
+		const float pitch = atan2f(x_h, z_h);                        // negative = nose down
+
+		if (pitch < pitch_ceiling) {
+			// Missing horizontal force: |tan(pitch)| - |tan(ceiling)|.
+			// Both angles are negative, so negate to work with the magnitudes.
+			const float deficit = tanf(-pitch) - tanf(-pitch_ceiling);
+			_fwd_thrust = math::constrain(deficit * _fwd_thrust_sc, 0.f, _fwd_thrust_max);
+
+			// Rebuild body_z with the pitch clamped, keeping roll and heading. In the heading frame
+			// the body z axis is (sin(pitch)*cos(roll), -sin(roll), cos(pitch)*cos(roll)), unit
+			// length. Take the roll from the already tilt-limited vector so the rebuild cannot
+			// reintroduce tilt that MPC_TILTMAX_AIR just removed.
+			const float y_lim = -sy * body_z(0) + cy * body_z(1);
+			const float roll = -asinf(math::constrain(y_lim, -1.f, 1.f));
+			const float cos_roll = cosf(roll);
+
+			const float x_n = sinf(pitch_ceiling) * cos_roll;
+			const float y_n = -sinf(roll);
+			const float z_n = cosf(pitch_ceiling) * cos_roll;
+
+			body_z(0) = cy * x_n - sy * y_n;
+			body_z(1) = sy * x_n + cy * y_n;
+			body_z(2) = z_n;
+
+			// Safety net: roll plus a shallow pitch can still exceed the absolute tilt limit
+			// (e.g. MPC_PITCH_MIN looser than MPC_TILTMAX_AIR), so re-apply it.
+			ControlMath::limitTilt(body_z, Vector3f(0, 0, 1), _lim_tilt);
+		}
+	}
+
 	// Convert to thrust assuming hover thrust produces standard gravity
 	const float thrust_ned_z = _acc_sp(2) * (_hover_thrust / CONSTANTS_ONE_G) - _hover_thrust;
 	// Project thrust to planned body attitude
@@ -270,4 +332,12 @@ void PositionControl::getAttitudeSetpoint(vehicle_attitude_setpoint_s &attitude_
 {
 	ControlMath::thrustToAttitude(_thr_sp, _yaw_sp, attitude_setpoint);
 	attitude_setpoint.yaw_sp_move_rate = _yawspeed_sp;
+
+	// Forward thrust for the front-facing thrusters, computed in _accelerationControl().
+	// thrust_body is normalised per axis by the allocator (ControlAllocationPseudoInverse divides
+	// every thrust axis by the mean magnitude of its pseudo-inverse column), so this is NOT a force
+	// in Newtons -- 1.0 means "the actuators that produce body-x force at full scale".
+	// thrustToAttitude() only writes thrust_body[2] and the struct is zero initialised, so with
+	// _fwd_thrust == 0 (assist disabled) the output is byte-identical to before this feature.
+	attitude_setpoint.thrust_body[0] = _fwd_thrust;
 }

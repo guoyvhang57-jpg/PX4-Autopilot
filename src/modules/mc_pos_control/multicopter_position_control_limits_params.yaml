@@ -103,3 +103,75 @@ parameters:
           Unset if accurate position tracking during dynamic maneuvers is more important than a smooth flight.
       type: boolean
       default: 1
+    MYM_PITCH_MIN:
+      description:
+        short: Nose-down pitch ceiling for the forward-thrust assist
+        long: |-
+          When the demanded pitch goes below this value the output attitude is clamped here, and the
+          horizontal force that the shallower attitude can no longer produce is handed to the
+          vehicle's forward-facing thrusters (vehicle_attitude_setpoint.thrust_body[0]).
+          Only active when MYM_FWD_THR_EN is set.
+
+          Negative = nose down. 0 disables the clamp.
+
+          This does not replace MPC_TILTMAX_AIR: that stays the absolute tilt ceiling in every
+          direction, while this one is the tighter, nose-down-only ceiling that triggers the assist.
+          Whichever is shallower wins, so with the defaults (45 deg vs -15 deg) the nose-down
+          direction is limited by this one and everything else by MPC_TILTMAX_AIR.
+      type: float
+      default: -15.0
+      unit: deg
+      min: -30.0
+      max: 0.0
+      decimal: 1
+      increment: 1
+    MYM_FWD_THR_EN:
+      description:
+        short: Forward-thrust assist
+        long: |-
+          Route the force deficit of a clamped nose-down attitude to the vehicle's forward-facing
+          thrusters instead of losing it as tracking error. Requires those thrusters to be part of the
+          control allocation (CA_ROTORn with a non-zero x component in the thrust axis).
+
+          Leave disabled on a plain multirotor: no actuator can produce body-x force there, so the
+          demand would just stay unallocated.
+
+          Disabled = output byte-identical to a build without this feature.
+      type: enum
+      values:
+        0: Disabled
+        1: Enabled
+      default: 0
+    MYM_FWD_THR_SC:
+      description:
+        short: Missing horizontal force to forward thrust conversion
+        long: |-
+          Converts the missing horizontal force [N] into the normalised forward thrust written to
+          thrust_body[0]. This is a geometric conversion, not a tuning gain.
+
+          SC = m * g / K_F
+
+          with K_F the forward force [N] that one unit of thrust_body[0] produces. K_F follows from the
+          allocator geometry: for the gz towed airframe (CA_ROTOR_COUNT 6, four lift rotors plus two
+          thrusters mounted at 70 deg) one unit of thrust_body[0] is about 90.7 N forward, so with
+          4.087 kg it is 40.09 / 90.7 = 0.44.
+      type: float
+      default: 0.44
+      min: 0.0
+      max: 5.0
+      decimal: 3
+      increment: 0.01
+    MYM_FWD_THR_MAX:
+      description:
+        short: Maximum normalised forward thrust
+        long: |-
+          Upper bound for the thrust_body[0] value produced by the assist. Keep it below the point
+          where the forward thrusters saturate: once they do, the assist can no longer make up the
+          deficit and the tracking error simply grows.
+      type: float
+      default: 0.5
+      unit: norm
+      min: 0.0
+      max: 1.0
+      decimal: 2
+      increment: 0.05

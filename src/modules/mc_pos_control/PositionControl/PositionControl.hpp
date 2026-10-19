@@ -121,6 +121,30 @@ public:
 	void setTiltLimit(const float tilt) { _lim_tilt = tilt; }
 
 	/**
+	 * Enable and configure the forward-thrust assist (multirotor with forward-facing thrusters).
+	 *
+	 * When the demanded pitch is more nose-down than @p pitch_min, the output attitude is clamped
+	 * to @p pitch_min and the horizontal force that the shallower attitude can no longer produce is
+	 * handed to the forward thrusters through vehicle_attitude_setpoint.thrust_body[0]
+	 * (see getAttitudeSetpoint()). The rest of the vehicle keeps working exactly as before: the
+	 * vertical loop still holds altitude and the allocator still balances the torques.
+	 *
+	 * Disabled by default, and when disabled the attitude setpoint is bit-identical to before.
+	 *
+	 * @param enable      false leaves the output untouched
+	 * @param pitch_min   nose-down pitch ceiling [rad], negative (e.g. radians(-15)). 0 disables the clamp
+	 * @param sc          missing-horizontal-force [N] to normalized forward thrust conversion
+	 * @param thrust_max  upper bound of the normalized forward thrust [0,1]
+	 */
+	void setForwardThrust(const bool enable, const float pitch_min, const float sc, const float thrust_max)
+	{
+		_fwd_thrust_en = enable;
+		_pitch_min = pitch_min;
+		_fwd_thrust_sc = sc;
+		_fwd_thrust_max = thrust_max;
+	}
+
+	/**
 	 * Set the normalized hover thrust
 	 * @param hover_thrust [HOVER_THRUST_MIN, HOVER_THRUST_MAX] with which the vehicle hovers not accelerating down or up with level orientation
 	 */
@@ -161,7 +185,7 @@ public:
 	 * Set the integral term in xy to 0.
 	 * @see _vel_int
 	 */
-	void resetIntegral() { _vel_int.setZero(); }
+	void resetIntegral() { _vel_int.setZero(); _fwd_thrust = 0.f; }
 	void resetIntegralXY() { _vel_int.xy() = matrix::Vector2f(); }
 
 	/**
@@ -215,6 +239,14 @@ private:
 	float _lim_thr_max{}; ///< Maximum collective thrust allowed as output [-1,0] e.g. -0.1
 	float _lim_thr_xy_margin{}; ///< Margin to keep for horizontal control when saturating prioritized vertical thrust
 	float _lim_tilt{}; ///< Maximum tilt from level the output attitude is allowed to have
+
+	// Forward-thrust assist: when the demanded pitch goes below _pitch_min, the attitude is clamped
+	// and the resulting force deficit is routed to the forward thrusters (thrust_body[0]).
+	float _fwd_thrust{0.f}; ///< Normalized forward thrust written to thrust_body[0], [0,1]
+	bool _fwd_thrust_en{false}; ///< Assist enabled (default off: output unchanged)
+	float _pitch_min{0.f}; ///< Nose-down pitch ceiling [rad], negative; below it the deficit becomes forward thrust
+	float _fwd_thrust_sc{0.f}; ///< Missing horizontal force [N] -> normalized forward thrust
+	float _fwd_thrust_max{0.5f}; ///< Upper bound of the normalized forward thrust
 
 	float _hover_thrust{}; ///< Thrust [HOVER_THRUST_MIN, HOVER_THRUST_MAX] with which the vehicle hovers not accelerating down or up with level orientation
 	bool _decouple_horizontal_and_vertical_acceleration{true}; ///< Ignore vertical acceleration setpoint to remove its effect on the tilt setpoint

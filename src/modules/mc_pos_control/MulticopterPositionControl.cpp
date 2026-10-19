@@ -521,6 +521,23 @@ void MulticopterPositionControl::Run()
 						     ? _param_mpc_tiltmax_lnd.get() : _param_mpc_tiltmax_air.get();
 			_control.setTiltLimit(_tilt_limit_slew_rate.update(math::radians(tilt_limit_deg), dt));
 
+			// Forward-thrust assist: clamp the nose-down pitch to MYM_PITCH_MIN and hand the force
+			// deficit to the forward-facing thrusters.
+			//
+			// Offboard only. This is an airframe-specific, experimental feature, so it is scoped to
+			// the offboard mission instead of changing how every position-controlled mode feels --
+			// otherwise POSCTL/ALTCTL/AUTO would inherit the MYM_PITCH_MIN nose-down ceiling too.
+			// Outside Offboard the assist is off and MYM_PITCH_MIN goes unused.
+			//
+			// The gate lives here and not in PositionControl because that class is a pure control law
+			// with no access to the flight mode. It also ignores a non-negative MYM_PITCH_MIN, so a
+			// misconfiguration cannot force a nose-up attitude.
+			_control.setForwardThrust(_param_mym_fwd_thr_en.get() != 0
+						  && _vehicle_control_mode.flag_control_offboard_enabled,
+						  math::radians(_param_mym_pitch_min.get()),
+						  _param_mym_fwd_thr_sc.get(),
+						  _param_mym_fwd_thr_max.get());
+
 			const float speed_up = _takeoff.updateRamp(dt,
 					       PX4_ISFINITE(_vehicle_constraints.speed_up) ? _vehicle_constraints.speed_up : _param_mpc_z_vel_max_up.get());
 			const float speed_down = PX4_ISFINITE(_vehicle_constraints.speed_down) ? _vehicle_constraints.speed_down :
