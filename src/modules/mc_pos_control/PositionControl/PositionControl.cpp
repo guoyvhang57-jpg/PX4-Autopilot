@@ -187,7 +187,11 @@ void PositionControl::_velocityControl(const float dt)
 
 	// Use tracking Anti-Windup for horizontal direction: during saturation, the integrator is used to unsaturate the output
 	// see Anti-Reset Windup for PID controllers, L.Rundqwist, 1990
-	const Vector2f acc_sp_xy_produced = Vector2f(_thr_sp) * (CONSTANTS_ONE_G / _hover_thrust);
+	Vector2f acc_sp_xy_produced = Vector2f(_thr_sp) * (CONSTANTS_ONE_G / _hover_thrust);
+
+	// _thr_sp only covers the tilt. The forward thrusters add horizontal acceleration that is not in
+	// it, and leaving it out makes the anti-windup below see a shortfall that does not exist.
+	acc_sp_xy_produced += _fwd_acc_xy;
 
 	// The produced acceleration can be greater or smaller than the desired acceleration due to the saturations and the actual vertical thrust (computed independently).
 	// The ARW loop needs to run if the signal is saturated only.
@@ -233,6 +237,7 @@ void PositionControl::_accelerationControl()
 	ControlMath::limitTilt(body_z, Vector3f(0, 0, 1), _lim_tilt);
 
 	_fwd_thrust = 0.f;
+	_fwd_acc_xy.setZero();
 
 	// Effective nose-down ceiling: the tighter of MPC_PITCH_MIN and -MPC_TILTMAX_AIR, so the assist
 	// can never loosen a limit that MPC_TILTMAX_AIR already imposed.
@@ -275,6 +280,31 @@ void PositionControl::_accelerationControl()
 			// Safety net: roll plus a shallow pitch can still exceed the absolute tilt limit
 			// (e.g. MPC_PITCH_MIN looser than MPC_TILTMAX_AIR), so re-apply it.
 			ControlMath::limitTilt(body_z, Vector3f(0, 0, 1), _lim_tilt);
+
+			// Horizontal acceleration the forward thrusters contribute. _thr_sp (below) only covers
+			// the tilt, so without this the anti-windup in _velocityControl() sees a shortfall that
+			// does not exist and freezes the velocity integrator: measured, a 15 m/s setpoint stalled
+			// at 13.6 m/s against a phantom 1.26 m/s^2 gap.
+			//
+			// thrust_body[0] maps to a body-x force through K_F and SC = m*g/K_F, so g/SC is the
+			// body-x acceleration per unit of thrust_body[0] -- no separate calibration needed.
+			//
+			// No tilt projection. a_body_x is by construction exactly the deficit this assist was
+			// asked to fill (_fwd_thrust = (tan(pitch_demand) - tan(ceiling)) * SC, so
+			// a_body_x = a_desired - a_tilt), which makes acc_sp_xy_produced equal a_desired whenever
+			// the thrusters are not clipped -- which is the correct statement of "not saturated".
+			// Projecting by cos(pitch) would instead under-count: the thrusters push along an axis
+			// mounted ~20 deg above body x, so their true horizontal share at 15 deg pitch is
+			// cos(pitch) + (AZ/AX)*sin(pitch) = 1.06, not 0.966. That phantom gap left a 0.07 m/s
+			// residual (simulated 14.93 m/s against a 15 m/s setpoint).
+			//
+			// Once the assist clips at MYM_FWD_THR_MAX, a_body_x stops growing and
+			// acc_sp_xy_produced falls below a_desired, so the anti-windup still engages exactly when
+			// it should. The 0.342 vertical part of the thrust axis is left to the z integrator.
+			if (_fwd_thrust_sc > FLT_EPSILON) {
+				const float a_body_x = _fwd_thrust * CONSTANTS_ONE_G / _fwd_thrust_sc;
+				_fwd_acc_xy = Vector2f(cy, sy) * a_body_x;
+			}
 		}
 	}
 

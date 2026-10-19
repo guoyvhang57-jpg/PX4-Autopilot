@@ -185,7 +185,7 @@ public:
 	 * Set the integral term in xy to 0.
 	 * @see _vel_int
 	 */
-	void resetIntegral() { _vel_int.setZero(); _fwd_thrust = 0.f; }
+	void resetIntegral() { _vel_int.setZero(); _fwd_thrust = 0.f; _fwd_acc_xy.setZero(); }
 	void resetIntegralXY() { _vel_int.xy() = matrix::Vector2f(); }
 
 	/**
@@ -247,6 +247,7 @@ private:
 	float _pitch_min{0.f}; ///< Nose-down pitch ceiling [rad], negative; below it the deficit becomes forward thrust
 	float _fwd_thrust_sc{0.f}; ///< Missing horizontal force [N] -> normalized forward thrust
 	float _fwd_thrust_max{0.5f}; ///< Upper bound of the normalized forward thrust
+	matrix::Vector2f _fwd_acc_xy{}; ///< Horizontal acceleration [m/s^2] the forward thrusters add; not part of _thr_sp
 
 	float _hover_thrust{}; ///< Thrust [HOVER_THRUST_MIN, HOVER_THRUST_MAX] with which the vehicle hovers not accelerating down or up with level orientation
 	bool _decouple_horizontal_and_vertical_acceleration{true}; ///< Ignore vertical acceleration setpoint to remove its effect on the tilt setpoint
