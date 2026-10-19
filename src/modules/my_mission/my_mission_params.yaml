@@ -55,7 +55,7 @@ parameters:
       default: 0.5
       decimal: 2
       min: 0.1
-      max: 10.0
+      max: 20.0
       unit: m/s
     MYM_FWD_ACC:
       description:
