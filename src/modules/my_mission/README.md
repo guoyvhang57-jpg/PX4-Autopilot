@@ -120,9 +120,12 @@ WAIT ──手势解锁 + 进 Offboard──> TAKEOFF ──到达 MYM_ALT──
 ### 几何：三个点
 
 ```
-锚点     = 起飞点 + 地面机体系(MYR_ANCHOR_X, MYR_ANCHOR_Y, MYR_ANCHOR_Z)
+锚点     = EKF 本地原点 + 地面机体系(MYR_ANCHOR_X, MYR_ANCHOR_Y, MYR_ANCHOR_Z)
                     地面机体系 = 去掉倾斜的机体系：X 前 / Y 右 / Z 下
                     （和 NED 一样向下为正，所以 MYR_ANCHOR_Z 一般填 0）
+                    ⚠ 基准是**本地原点**（拿到第一个位置估计的点：仿真里 = 模型
+                      出生点，真机 = 上电位置），**不是起飞点** —— 锚点在地面上
+                      是固定的，用起飞点会让它随着每次落点漂走
 绷紧点   = 锚点 + 沿起飞航向 L*cos(θ)  +  往上 L*sin(θ)
                     L = MYR_ROPE_LEN，θ = MYR_ROPE_ANGLE
 ```

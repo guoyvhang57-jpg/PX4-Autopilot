@@ -194,7 +194,6 @@ private:
 	matrix::Vector3f _target{};       ///< 位置环目标，机体系无关的本地 NED 坐标
 	matrix::Vector3f _goal3{};        ///< 中转目标（三维 NED）
 	bool _rope_leg{false};            ///< 本次中转飞的是绷紧点（TAKEOFF 到位时闩锁，之后不再看参数）
-	matrix::Vector3f _takeoff_pos{};  ///< 起飞点（NED），锚点/绷紧点的基准
 	float _goal_distance{0.f};        ///< 平滑器离终点还剩多远（到位判据 / 超时日志用）
 	float _ground_z{0.f};             ///< 进入 Offboard 时的 z（NED），作为降落的目标地面高度
 	float _yaw_sp{0.f};               ///< 锁存的航向，每拍原样发给 trajectory_setpoint.yaw

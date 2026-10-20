@@ -233,11 +233,18 @@ bool MyMission::advanceTransit(const Tick &tick)
 // ===========================================================================
 void MyMission::solveRope()
 {
-	// 几何一次算定：只依赖起飞点、起飞航向和 MYR_*，之后不再变。
-	// 之后不管是 TAKEOFF 直接过去、还是先 FORWARD 再过去，用的都是同一份锚点/绷紧点，
-	// 不会因为中途改参数而前后不一致。
+	// 几何一次算定：只依赖 **EKF 本地原点**、起飞航向和 MYR_*，之后不再变。
+	//
+	// 基准是原点 (0,0,0)，**不是起飞点**。这一点很关键：绳子的锚点是地面上
+	// 一个固定的点，不该随飞机走。用起飞点做基准的话，落一次地再重新解锁，
+	// 锚点就跟着落点跑了，而仿真里的绳还拴在出生点 —— 第二趟就会算到一个
+	// 错误的绷紧点（表现：飞到了却不低头）。用原点之后，同一个上电会话里
+	// 跑多少趟，锚点都不变。
+	//
+	// EKF 本地原点 = 拿到第一个有效位置估计的那个点，仿真里就是模型的出生点，
+	// 真机上就是上电时飞机所在的位置 —— 所以现场要把飞机摆在系绳桩附近再上电。
 	_rope.setConfig(_config.rope);
-	_rope_solution = _rope.solve(_takeoff_pos, _takeoff_yaw);
+	_rope_solution = _rope.solve(matrix::Vector3f(), _takeoff_yaw);
 }
 
 void MyMission::logTransitStart(const Tick &tick)
@@ -390,11 +397,6 @@ void MyMission::stateWait(const Tick &tick)
 		// 目标高度 = 地面 z - MYM_ALT（减去一个正数 = 往上）。
 		_ground_z = tick.pos.z;
 		_target(2) = _ground_z - _config.alt;
-
-		// 系绳测试的锚点/绷紧点都以**起飞点**为基准，钉死这一刻的三维位置。
-		// 用 pos（EKF 当前位置）而不是 _target：两者此刻本来就相等
-		// （holdCurrentPosition 每拍把 _target 钉在当前位置），但 pos 是实测值。
-		_takeoff_pos = matrix::Vector3f(tick.pos.x, tick.pos.y, tick.pos.z);
 
 		// 锁死这一刻的航向。_yaw_sp 是 holdCurrentPosition() 每拍从姿态里抄的，
 		// 出了 WAIT 就没人再刷新它（只有 WAIT/DONE 调 holdCurrentPosition），
@@ -795,12 +797,14 @@ Offboard position-control mission demo for a multicopter:
   -> HOVER (MYM_HOVER, forward destination and no-destination cases)
   -> LAND (offboard descent or PX4 AUTO_LAND) -> DISARM -> DONE
 
-The rope geometry is latched when the takeoff completes: the anchor is
-MYR_ANCHOR_{X,Y,Z} from the takeoff point in the level body frame (forward /
-right / down, so MYR_ANCHOR_Z is positive downwards), and the taut point sits
-MYR_ROPE_LEN*cos(MYR_ROPE_ANGLE) ahead of it along the takeoff heading and
-MYR_ROPE_LEN*sin(MYR_ROPE_ANGLE) above it. The destination type is latched with
-it -- changing MYR_ROPE_LEN in flight does not change where this run goes.
+The rope geometry is solved once, when the takeoff completes. The anchor is
+MYR_ANCHOR_{X,Y,Z} from the local origin -- not from the takeoff point, so that
+landing and re-arming does not drag the anchor along with the vehicle -- in the
+level body frame (forward / right / down, so MYR_ANCHOR_Z is positive
+downwards). The taut point sits MYR_ROPE_LEN*cos(MYR_ROPE_ANGLE) ahead of it
+along the takeoff heading and MYR_ROPE_LEN*sin(MYR_ROPE_ANGLE) above it. The
+destination type is latched with it -- changing MYR_ROPE_LEN in flight does not
+change where this run goes.
 
 TILT is realised as an acceleration feedforward of g*tan(MYR_PITCH_DOWN) along
 the takeoff heading; the rope holds the vehicle back, so the resulting attitude

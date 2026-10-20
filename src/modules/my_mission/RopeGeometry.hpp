@@ -29,8 +29,9 @@
  *
  * 三样东西：
  *
- *   起飞点  —— 由调用方给（NED，地面上那个点）
- *   锚点    —— 起飞点 + 地面机体系(MYR_ANCHOR_X, Y, Z)
+ *   基准点  —— 由调用方给（NED）。my_mission 传的是 **EKF 本地原点 (0,0,0)**，
+ *              不是起飞点：锚点在地面上是固定的，不能随飞机走
+ *   锚点    —— 基准点 + 地面机体系(MYR_ANCHOR_X, Y, Z)
  *              地面机体系 = 去掉倾斜的机体系：X 前 / Y 右 / Z 下
  *              （和 NED 一样向下为正，所以 MYR_ANCHOR_Z 一般填 0）
  *   绷紧点  —— 锚点沿**起飞航向**水平 L*cos(θ)，再往上 L*sin(θ)
@@ -50,7 +51,7 @@
  * 全部来自参数，没有任何硬编码的几何量（只有合法范围的下/上限）。
  */
 struct RopeConfig {
-	matrix::Vector3f anchor_offset_body{};  ///< 锚点相对起飞点，地面机体系 前/右/下 [m]
+	matrix::Vector3f anchor_offset_body{};  ///< 锚点相对基准点，地面机体系 前/右/下 [m]
 	float rope_length{0.f};                 ///< 绳长 [m]，0 = 不做系绳段
 	float rope_angle_deg{30.f};             ///< 绷紧时绳和地面的夹角 [deg]
 };
@@ -66,7 +67,7 @@ struct RopeSolution {
 /**
  * @class RopeGeometry
  *
- * 把 RopeConfig + (起飞点, 起飞航向) 解成 RopeSolution。
+ * 把 RopeConfig + (基准点, 起飞航向) 解成 RopeSolution。
  */
 class RopeGeometry
 {
@@ -92,10 +93,10 @@ public:
 	 * 只应该在 enabled() 为真时调用；否则返回全零（调用方自己用
 	 * MissionConfig::ropeEnabled() 判断要不要用这个结果）。
 	 *
-	 * @param takeoff_pos 起飞点（NED，地面坐标系）
-	 * @param takeoff_yaw 起飞那一刻的航向 [rad]
+	 * @param reference_pos 基准点（NED）。my_mission 传本地原点 (0,0,0)
+	 * @param takeoff_yaw   起飞那一刻的航向 [rad]，决定绷紧点的方位
 	 */
-	RopeSolution solve(const matrix::Vector3f &takeoff_pos, float takeoff_yaw) const;
+	RopeSolution solve(const matrix::Vector3f &reference_pos, float takeoff_yaw) const;
 
 	/// 飞机到锚点的斜距 [m]
 	static float slant(const matrix::Vector3f &anchor, const matrix::Vector3f &pos);

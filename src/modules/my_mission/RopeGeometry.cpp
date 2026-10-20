@@ -26,7 +26,7 @@
 
 #include <mathlib/mathlib.h>
 
-RopeSolution RopeGeometry::solve(const matrix::Vector3f &takeoff_pos, float takeoff_yaw) const
+RopeSolution RopeGeometry::solve(const matrix::Vector3f &reference_pos, float takeoff_yaw) const
 {
 	RopeSolution solution{};
 
@@ -46,9 +46,9 @@ RopeSolution RopeGeometry::solve(const matrix::Vector3f &takeoff_pos, float take
 	const float s = sinf(takeoff_yaw);
 	const matrix::Vector3f &off = _config.anchor_offset_body;
 
-	solution.anchor(0) = takeoff_pos(0) + off(0) * c - off(1) * s;
-	solution.anchor(1) = takeoff_pos(1) + off(0) * s + off(1) * c;
-	solution.anchor(2) = takeoff_pos(2) + off(2);
+	solution.anchor(0) = reference_pos(0) + off(0) * c - off(1) * s;
+	solution.anchor(1) = reference_pos(1) + off(0) * s + off(1) * c;
+	solution.anchor(2) = reference_pos(2) + off(2);
 
 	// ---- 绷紧点 ----
 	// 距离锚点水平 L*cos(θ)、高出 L*sin(θ)。这样斜距正好等于 L，
