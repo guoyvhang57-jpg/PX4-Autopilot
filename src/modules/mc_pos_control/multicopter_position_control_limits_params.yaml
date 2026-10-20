@@ -105,19 +105,17 @@ parameters:
       default: 1
     MYM_PITCH_MIN:
       description:
-        short: Nose-down pitch ceiling for the forward-thrust assist
+        short: 前推力辅助的低头角上限
         long: |-
-          When the demanded pitch goes below this value the output attitude is clamped here, and the
-          horizontal force that the shallower attitude can no longer produce is handed to the
-          vehicle's forward-facing thrusters (vehicle_attitude_setpoint.thrust_body[0]).
-          Only active when MYM_FWD_THR_EN is set.
+          需求俯仰角低于这个值时，输出姿态被夹在这里，而"更平的姿态压不出来"的那部分
+          水平力交给机头方向的推进电机（vehicle_attitude_setpoint.thrust_body[0]）。
+          只在 MYM_FWD_THR_EN 打开时生效。
 
-          Negative = nose down. 0 disables the clamp.
+          负值 = 低头。0 = 关闭这个夹紧。
 
-          This does not replace MPC_TILTMAX_AIR: that stays the absolute tilt ceiling in every
-          direction, while this one is the tighter, nose-down-only ceiling that triggers the assist.
-          Whichever is shallower wins, so with the defaults (45 deg vs -15 deg) the nose-down
-          direction is limited by this one and everything else by MPC_TILTMAX_AIR.
+          它**不替代** MPC_TILTMAX_AIR：那个仍然是所有方向上的绝对倾角上限，
+          这个是更严的、只管低头的上限，用来触发辅助。两者取更平的那个 ——
+          按默认值（45° 对 -15°），低头方向由这个限制，其它方向由 MPC_TILTMAX_AIR 限制。
       type: float
       default: -15.0
       unit: deg
@@ -127,34 +125,34 @@ parameters:
       increment: 1
     MYM_FWD_THR_EN:
       description:
-        short: Forward-thrust assist
+        short: 前推力辅助
         long: |-
-          Route the force deficit of a clamped nose-down attitude to the vehicle's forward-facing
-          thrusters instead of losing it as tracking error. Requires those thrusters to be part of the
-          control allocation (CA_ROTORn with a non-zero x component in the thrust axis).
+          把"被夹住的低头姿态压不出来"的那部分力交给机头方向的推进电机，
+          而不是把它当成跟踪误差丢掉。要求这些推进电机已经进了控制分配
+          （CA_ROTORn 的推力轴 x 分量非 0）。
 
-          Leave disabled on a plain multirotor: no actuator can produce body-x force there, so the
-          demand would just stay unallocated.
+          普通多旋翼保持关闭：那种机架上没有任何作动器能产生 body-x 方向的力，
+          需求只会一直分配不出去。
 
-          Disabled = output byte-identical to a build without this feature.
+          关闭 = 输出和不带这个功能的固件逐字节一致。
       type: enum
       values:
-        0: Disabled
-        1: Enabled
+        0: 关闭
+        1: 打开
       default: 0
     MYM_FWD_THR_SC:
       description:
-        short: Missing horizontal force to forward thrust conversion
+        short: 缺失水平力到前推力的换算系数
         long: |-
-          Converts the missing horizontal force [N] into the normalised forward thrust written to
-          thrust_body[0]. This is a geometric conversion, not a tuning gain.
+          把缺失的水平力 [N] 换算成写进 thrust_body[0] 的归一化前推力。
+          这是**几何换算，不是调参增益**。
 
           SC = m * g / K_F
 
-          with K_F the forward force [N] that one unit of thrust_body[0] produces. K_F follows from the
-          allocator geometry: for the gz towed airframe (CA_ROTOR_COUNT 6, four lift rotors plus two
-          thrusters mounted at 70 deg) one unit of thrust_body[0] is about 90.7 N forward, so with
-          4.087 kg it is 40.09 / 90.7 = 0.44.
+          K_F 是一个单位的 thrust_body[0] 能产生的前向力 [N]，由分配器几何决定：
+          gz 的 towed 机架（CA_ROTOR_COUNT 6，四个升力桨 + 两个装在 70° 的推进电机）
+          一个单位 thrust_body[0] 约等于 90.7 N 前向力，按 4.087 kg 算是
+          40.09 / 90.7 = 0.44。
       type: float
       default: 0.44
       min: 0.0
@@ -163,11 +161,10 @@ parameters:
       increment: 0.01
     MYM_FWD_THR_MAX:
       description:
-        short: Maximum normalised forward thrust
+        short: 归一化前推力的上限
         long: |-
-          Upper bound for the thrust_body[0] value produced by the assist. Keep it below the point
-          where the forward thrusters saturate: once they do, the assist can no longer make up the
-          deficit and the tracking error simply grows.
+          辅助产生的 thrust_body[0] 的上界。要留在推进电机饱和之前：
+          一旦饱和，辅助就再也补不上缺额，跟踪误差只会越来越大。
       type: float
       default: 0.5
       unit: norm
