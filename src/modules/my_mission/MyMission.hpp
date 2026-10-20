@@ -18,11 +18,37 @@
  *
  ****************************************************************************/
 
+/**
+ * @file MyMission.hpp
+ *
+ * Offboard 位置控制的任务模块。Offboard 本身是什么、三条 topic 怎么配合、
+ * 飞手要按什么顺序操作 —— 全在 docs/offboard.md，这里只讲结构。
+ *
+ * ===========================================================================
+ * 这个模块被拆成 6 块（每块一个文件）
+ * ===========================================================================
+ *   MyMission.{hpp,cpp}   任务编排：状态机 + 9 个状态函数。就是"什么时候做什么"。
+ *   MissionConfig.hpp     MYM_* / MYR_* 参数的一份只读快照（POD）。
+ *   MissionOutput.{...}   所有出站 topic（offboard_control_mode / trajectory_setpoint /
+ *                         vehicle_command）。**只有它能发 topic。**
+ *   TransitLeg.{...}      "用 PX4 的轨迹生成器飞到一个定点"，FORWARD 和 ROPE 共用。
+ *   RopeGeometry.{...}    系绳几何，纯函数，不碰 uORB/参数。
+ *   ExternalParams.{...}  从别人的参数（MPC_* / MAN_DEADZONE / LNDMC_Z_VEL_MAX）抄阈值。
+ *   TakeoverMonitor.{...} 接管安全：飞出 Offboard 时油门没回中会掉高度。
+ *
+ * 依赖方向是单向的：MyMission → 其它，其它之间互不依赖（RopeGeometry 谁也不依赖）。
+ *
+ * ===========================================================================
+ * 类的形状（三个基类，顺序别改）
+ * ===========================================================================
+ *   ModuleBase             —— 命令行框架：`my_mission start/stop/status` 由它分发
+ *   ModuleParams           —— 参数框架：DEFINE_PARAMETERS 里的 MYM_x / MYR_x 由它托管
+ *   px4::ScheduledWorkItem —— 周期任务：ScheduleOnInterval() 定时，到点回调 Run()
+ */
+
 #pragma once
 
 #include <math.h>
-
-#include <motion_planning/PositionSmoothing.hpp>
 
 #include <matrix/matrix/math.hpp>
 
@@ -31,55 +57,24 @@
 #include <px4_platform_common/module_params.h>
 #include <px4_platform_common/px4_work_queue/ScheduledWorkItem.hpp>
 
-#include <uORB/Publication.hpp>
 #include <uORB/Subscription.hpp>
 #include <uORB/topics/actuator_armed.h>
 #include <uORB/topics/manual_control_setpoint.h>
-#include <uORB/topics/offboard_control_mode.h>
 #include <uORB/topics/parameter_update.h>
-#include <uORB/topics/trajectory_setpoint.h>
 #include <uORB/topics/vehicle_attitude.h>
-#include <uORB/topics/vehicle_command.h>
 #include <uORB/topics/vehicle_land_detected.h>
 #include <uORB/topics/vehicle_local_position.h>
 #include <uORB/topics/vehicle_status.h>
 
+#include "ExternalParams.hpp"
+#include "MissionConfig.hpp"
+#include "MissionOutput.hpp"
+#include "RopeGeometry.hpp"
+#include "TakeoverMonitor.hpp"
+#include "TransitLeg.hpp"
+
 using namespace time_literals;
 
-/**
- * @class MyMission
- *
- * Offboard 位置控制的最小任务示例（起飞 -> 向前飞到目标点 -> 悬停 -> 降落 -> 上锁）。
- *
- * ===========================================================================
- * Offboard 的三条 topic（发布逻辑的全文在 MyMission.cpp 顶部注释里）
- * ===========================================================================
- *   - offboard_control_mode{position=true}，**50 Hz 一直发**
- *       commander 靠它判断 "Offboard 可用"：至少一个 flag 为 true，且 timestamp
- *       距今 < COM_OF_LOSS_T（默认 1 s）。必须在切进 Offboard **之前**就开始发，
- *       否则模式开关切不进去；进去之后断了就触发 failsafe。
- *       position=true → SetpointType::Trajectory → mc_pos_control 接管位置环。
- *
- *   - trajectory_setpoint（NED：x 北 / y 东 / **z 向下**；velocity/acceleration/jerk
- *       给 NaN = 该通道不受控）。这是喂给位置环的目标位置。
- *
- *   - vehicle_command（内部命令，target_system/component = 0 广播）：
- *       MAV_CMD_NAV_LAND            → 交给 PX4 的 AUTO_LAND（降落方式 1）
- *       MAV_CMD_COMPONENT_ARM_DISARM → param1=0 上锁
- *
- * ===========================================================================
- * 注意：offboard_control_mode 是单实例 topic
- * ===========================================================================
- * 同一时刻只能有一个模块在发。towed_control 也在发（attitude=true），
- * 两个同时跑会互相覆盖，commander 只认最后写的那份。所以 airframe 里只自启一个。
- *
- * ===========================================================================
- * 类的形状（三个基类，顺序别改）
- * ===========================================================================
- *   ModuleBase             —— 命令行框架：`my_mission start/stop/status` 由它分发
- *   ModuleParams           —— 参数框架：DEFINE_PARAMETERS 里的 MYM_* 由它托管
- *   px4::ScheduledWorkItem —— 周期任务：ScheduleOnInterval() 定时，到点回调 Run()
- */
 class MyMission : public ModuleBase, public ModuleParams, public px4::ScheduledWorkItem
 {
 public:
@@ -99,123 +94,121 @@ public:
 private:
 	void Run() override;
 
-	// 状态机：整个任务就是这 7 个状态之间的迁移，迁移条件全在 Run() 里。
-	// 前 5 个状态每拍都要发 offboard_control_mode（否则 Offboard 信号会超时），
-	// 其中 Wait/Takeoff/Forward/Hover/Land(方式0) 还要发 trajectory_setpoint。
+	// 状态机：整个任务就是这 9 个状态之间的迁移。
+	// 前 9 个状态每拍都要发 offboard_control_mode（否则 Offboard 信号会超时），
+	// 其中除 Land(方式1) / Disarm 之外还要发 trajectory_setpoint。
 	enum class State {
 		Wait,     ///< 等 armed + Offboard + 位置有效；setpoint 钉在当前位置
 		Takeoff,  ///< 目标 = 地面参考上方 MYM_ALT，等位置/速度都到位
-		Forward,  ///< 交给 PositionSmoothing 生成轨迹飞到前方点（S 曲线 + 加速度前馈）；仅 DIST>0 时进
+		Forward,  ///< 用 TransitLeg 飞到**唯一的目的地**：开了绳是绷紧点，否则是前方点
+		Tilt,     ///< 停在绷紧点，按 MYR_PITCH_DOWN 低头，高度不变；保持 MYM_HOVER 秒
 		Hover,    ///< 保持同一 setpoint MYM_HOVER 秒
 		Land,     ///< 方式 1：发 NAV_LAND 交 AUTO_LAND；方式 0：自己把 z 斜坡拉回地面
 		Disarm,   ///< 发 COMPONENT_ARM_DISARM(param1=0)，1 Hz 重试直到 !armed
-		Done      ///< 结束；已上锁就回 Wait，允许再跑一遍
+		Done,     ///< 结束；已上锁就回 Wait，允许再跑一遍
+		Count     ///< 状态个数，给分发表做 static_assert 用
 	};
+
+	/**
+	 * @brief 一拍的输入
+	 *
+	 * 9 个状态函数都只吃这一个参数。传引用而不是拷贝：这些都是 Run() 里的局部变量，
+	 * 生命周期覆盖整个分发过程。
+	 */
+	struct Tick {
+		hrt_abstime now;
+		float dt;
+		const vehicle_local_position_s &pos;
+		const vehicle_attitude_s &att;
+		const actuator_armed_s &armed;
+		const vehicle_land_detected_s &land;
+		bool pos_valid;
+		bool offboard;
+	};
+
+	using Handler = void (MyMission::*)(const Tick &);
 
 	static const char *stateName(State state);
 
-	// ---- 发布：offboard 的三条 topic ----
-	void publishOffboardControlMode(hrt_abstime now);   // 每拍都发，问"交给哪一级"
-	// 四个可选覆盖量，不填就退回默认行为（位置=_target、速度/加速度=NaN=不控制）：
-	//
-	// z_velocity：向下速度前馈。PositionControl 是 P-位置环 + 速度前馈（两者相加，
-	// 不冲突），而 land detector 靠它判断"是否被指令下降"，所以自己下降时**必须**给，
-	// 否则 landed 永远上不去。NED，向下为正。
-	//
-	// xy_velocity：水平速度前馈，给"setpoint 正在移动的速度"能让位置误差≈0。
-	// 只写 velocity[0..1]，**不碰 velocity[2]**，所以和 land detector 无关。
-	//
-	// position_override：FORWARD/HOVER 里由 PositionSmoothing 生成的完整位置轨迹。
-	// 给有限值就覆盖 _target —— 这是路线 B 的核心：位置参考不再由本模块逐拍积分，
-	// 而是交给 PX4 自己的轨迹生成器（含 S 曲线 + 保证停在终点）。
-	//
-	// acceleration：**加速度前馈**，也是路线 B 的关键。PositionControl 把它直接加进
-	// 加速度指令（PositionControl.cpp:106 取值、:153 与速度环输出相加），所以它不经过
-	// 速度环那个一阶滞后（τ = 1/MPC_XY_VEL_P_ACC ≈ 0.56 s）。少了它，参考做匀速减速时
-	// 飞机会一直比参考快 a·τ（实测 0.60 m/s），到终点前就已经冲过去了。
-	void publishTrajectorySetpoint(hrt_abstime now, float z_velocity = NAN,
-				       const matrix::Vector2f &xy_velocity = matrix::Vector2f(NAN, NAN),
-				       const matrix::Vector3f &position_override = matrix::Vector3f(NAN, NAN, NAN),
-				       const matrix::Vector3f &acceleration = matrix::Vector3f(NAN, NAN, NAN));
-	void publishVehicleCommand(uint16_t command, float param1 = 0.f, float param2 = 0.f);
+	// ---- 9 个状态函数：每个都自己负责 _state / _state_start 的迁移 ----
+	// 返回值故意用 void 而不是"下一个状态"：现有代码里有几处迁移顺带做了别的事
+	// （_land_cmd_sent = false、_takeoff_yaw 锁存、几何解算……），而且 Disarm→Done
+	// 是**故意不刷** _state_start 的。让每个函数照自己原来的写法改状态，
+	// 这次重构才是"纯搬迁"，行为一个字节都不变。
+	void stateWait(const Tick &tick);
+	void stateTakeoff(const Tick &tick);
+	void stateForward(const Tick &tick);
+	void stateTilt(const Tick &tick);
+	void stateHover(const Tick &tick);
+	void stateLand(const Tick &tick);
+	void stateDisarm(const Tick &tick);
+	void stateDone(const Tick &tick);
+
+	void enterState(State next, hrt_abstime now) { _state = next; _state_start = now; }
+
+	// ---- 中转（FORWARD / ROPE 共用）----
+	TransitLeg::Limits transitLimits() const;
+	void enterTransit(const Tick &tick, State next);
+	bool advanceTransit(const Tick &tick);   ///< 推进一拍并发布，返回"到位"
+
+	// ---- 系绳测试 ----
+	void solveRope();                        ///< 按当前参数把锚点/绷紧点解出来
+	void logTransitStart(const Tick &tick);
+
+	// ---- 每拍 / 事件驱动的杂项 ----
+	void refreshConfig();
+	void publishControlMode(hrt_abstime now) { _output.publishControlMode(now); }
+	void publishSetpoint(const MissionOutput::Setpoint &setpoint, hrt_abstime now)
+	{
+		_output.publishSetpoint(setpoint, now);
+	}
+
+	/// "什么都不额外给，只把位置钉在 _target 上"—— 大多数状态用的就是这一帧
+	MissionOutput::Setpoint targetSetpoint() const;
 
 	// ---- 状态判断 / 工具 ----
-	bool localPositionValid(const vehicle_local_position_s &pos, hrt_abstime now) const;
+	static bool localPositionValid(const vehicle_local_position_s &pos, hrt_abstime now);
 	bool reachedTarget(const vehicle_local_position_s &pos) const;
 	void holdCurrentPosition(const vehicle_local_position_s &pos, const vehicle_attitude_s &att, bool pos_valid);
-	float elapsedSince(hrt_abstime start, hrt_abstime now) const { return (now - start) * 1e-6f; }
+	static float elapsedSince(hrt_abstime start, hrt_abstime now) { return (now - start) * 1e-6f; }
 
-	// ---- 接管安全：油门杆回中检测 ----
-	// 飞手把模式开关拨出 Offboard 时，高度通道立刻交回给油门杆：
-	//   杆在中位 -> 锁高度；杆不在中位 -> 按 MPC_Z_VEL_MAX_DN 立刻下降
-	// 这里只做"检测 + 告警"，不阻止飞手接管（也没法阻止，模式是 commander 切的）。
-	bool throttleStickCentered(const manual_control_setpoint_s &manual_control) const;
-	void checkTakeoverSafety(const vehicle_status_s &status, const manual_control_setpoint_s &manual_control);
-	// 刷新本模块需要"从别人的参数里抄"的两个阈值：MAN_DEADZONE、LNDMC_Z_VEL_MAX
-	void updateExternalParams();
+	// ---- 组件 ----
+	MissionOutput _output;
+	TransitLeg _transit;
+	ExternalParams _external;
+	TakeoverMonitor _takeover;
+	RopeGeometry _rope;
 
+	// ---- 配置快照 / 解出来的几何 ----
+	MissionConfig _config;            ///< 每拍从参数刷新的只读快照
+	RopeSolution _rope_solution;      ///< 进 ROPE 时解一次，之后不再变
+
+	// ---- 任务记忆（9 个状态共享，所以留在主类）----
 	State _state{State::Wait};
-	hrt_abstime _state_start{0};        ///< 进入当前状态的时刻，用来算超时/悬停计时
-	hrt_abstime _last_disarm_cmd{0};    ///< 上次发 disarm 的时刻，DISARM 状态里做 1 Hz 重试
-	bool _land_cmd_sent{false};         ///< NAV_LAND 是"切模式"命令，只在进 LAND 时发一次
-	bool _target_valid{false};          ///< false 时 trajectory_setpoint 的位置发 NaN
-	matrix::Vector3f _target{};         ///< 位置环目标，机体系无关的本地 NED 坐标
-	float _ground_z{0.f};               ///< 进入 Offboard 时的 z（NED），作为降落的目标地面高度
-	float _yaw_sp{0.f};                 ///< 锁存的航向，每拍原样发给 trajectory_setpoint.yaw
-	float _takeoff_yaw{0.f};            ///< 起飞那一刻的航向，Forward 用它算"机头正前方"
+	hrt_abstime _state_start{0};      ///< 进入当前状态的时刻，用来算超时/悬停计时
+	hrt_abstime _last_disarm_cmd{0};  ///< 上次发 disarm 的时刻，DISARM 状态里做 1 Hz 重试
+	hrt_abstime _last_rope_log{0};    ///< TILT 里 1 Hz 打一次斜距/绳角，和 gz 遥测对表
+	hrt_abstime _last_run{0};         ///< 上一拍的时刻，用来算真实的 dt（平滑器靠 dt 推进）
+	bool _land_cmd_sent{false};       ///< NAV_LAND 是"切模式"命令，只在进 LAND 时发一次
+	bool _target_valid{false};        ///< false 时 trajectory_setpoint 的位置发 NaN
+	matrix::Vector3f _target{};       ///< 位置环目标，机体系无关的本地 NED 坐标
+	matrix::Vector3f _goal3{};        ///< 中转目标（三维 NED）
+	bool _rope_leg{false};            ///< 本次中转飞的是绷紧点（TAKEOFF 到位时闩锁，之后不再看参数）
+	matrix::Vector3f _takeoff_pos{};  ///< 起飞点（NED），锚点/绷紧点的基准
+	float _goal_distance{0.f};        ///< 平滑器离终点还剩多远（到位判据 / 超时日志用）
+	float _ground_z{0.f};             ///< 进入 Offboard 时的 z（NED），作为降落的目标地面高度
+	float _yaw_sp{0.f};               ///< 锁存的航向，每拍原样发给 trajectory_setpoint.yaw
+	float _takeoff_yaw{0.f};          ///< 起飞那一刻的航向，Forward 用它算"机头正前方"
 
-	// ---- FORWARD 的参考生成：直接复用 PX4 的 PositionSmoothing ----
-	//
-	// 为什么不再自己写斜坡：原来的做法是逐拍把 _target 朝终点推，速度曲线上
-	// 只有"加速限幅 / 巡航上限 / 刹车限幅 sqrt(2ad)"三个约束，**没有加速度前馈**。
-	// 结果参考做匀速减速时，飞机永远比参考快 a·τ（τ = 1/MPC_XY_VEL_P_ACC ≈ 0.56 s），
-	// 实测 gz_towed 上 3 m 前进段稳定过冲 0.39~0.45 m，7 次复现。
-	//
-	// 现在交给 PositionSmoothing（和 GotoControl 用的是同一套，见 GotoControl.cpp:100）：
-	//   * 每拍先按上一拍解出的三段时长推进轨迹，再以新状态为起点重解一次
-	//   * 位置/速度/加速度/jerk 全部解析求得，终点速度、加速度严格为零
-	//   * 刹车速度上限由 computeMaxSpeedFromDistance 给（TrajMath.hpp:61-71），
-	//     它**扣掉了 jerk 建立减速度期间的滑行距离**，比 sqrt(2ad) 保守
-	//   * 输出的 acceleration 直接当加速度前馈发出去（这是修掉过冲的关键）
-	//
-	// 限制的映射原则：**能用 MYM_ 参数的就用 MYM_，气动/机体限制用 PX4 的**。
-	// 速度上限 = MYM_FWD_SPD，加速度上限 = MYM_FWD_ACC，jerk/绝对速度上限/
-	// 跟踪误差上限分别取 MPC_JERK_AUTO / MPC_XY_VEL_MAX / MPC_XY_ERR_MAX
-	// （和 GotoControl.hpp:99-102 的口径完全一致）。
-	PositionSmoothing _pos_smoothing;
-	matrix::Vector2f _fwd_goal{};       ///< FORWARD 的终点（xy，NED），进 FORWARD 时定死
-	matrix::Vector3f _fwd_goal3{};      ///< 同上，三维（z = 平飞高度），喂给平滑器
-	hrt_abstime _last_run{0};           ///< 上一拍的时刻，用来算真实的 dt（平滑器靠 dt 推进）
-
-	// ---- 接管安全（油门回中检测）----	// 用 param_find 而不是 DEFINE_PARAMETERS：MAN_DEADZONE 归 manual_control 管，
-	// 这里只是"读它来和 PX4 的油门中位判据保持一致"，不想把它拉进本模块的参数表。
-	param_t _param_man_deadzone{PARAM_INVALID};
-	float _man_deadzone{0.1f};          ///< 缓存的 MAN_DEADZONE，决定"算不算在中位"
-	param_t _param_lndmc_z_vel_max{PARAM_INVALID};
-	// 下面这几个同理：都是"和 PX4 行为对齐"的外部阈值，用 param_find 读，
-	// 不进本模块参数表。设错不会崩，最多是平滑器的手感和机体限制不一致。
-	param_t _param_mpc_xy_err_max{PARAM_INVALID};
-	float _mpc_xy_err_max{2.0f};        ///< MPC_XY_ERR_MAX（默认 2.0 m）→ 平滑器的水平跟踪误差上限
-	param_t _param_mpc_z_err_max{PARAM_INVALID};
-	float _mpc_z_err_max{1.0f};         ///< MPC_Z_ERR_MAX（默认 1.0 m）→ 竖直跟踪误差上限
-	param_t _param_mpc_jerk_auto{PARAM_INVALID};
-	float _mpc_jerk_auto{4.0f};         ///< MPC_JERK_AUTO（默认 4.0 m/s³）→ 平滑器的 jerk 上限
-	param_t _param_mpc_xy_vel_max{PARAM_INVALID};
-	float _mpc_xy_vel_max{12.0f};       ///< MPC_XY_VEL_MAX（默认 12 m/s）→ 平滑器的绝对速度天花板
-	param_t _param_mpc_z_v_auto_up{PARAM_INVALID};
-	float _mpc_z_v_auto_up{3.0f};       ///< MPC_Z_V_AUTO_UP（默认 3.0 m/s）→ 平滑器的上升速度上限
-	param_t _param_mpc_acc_up_max{PARAM_INVALID};
-	float _mpc_acc_up_max{4.0f};        ///< MPC_ACC_UP_MAX（默认 4.0 m/s²）→ 平滑器的上升加速度上限
-	float _in_descend_min_vel{0.275f};  ///< 1.1 * LNDMC_Z_VEL_MAX：land detector 认"被指令下降"的最低速度
+	// ---- 只告警一次的闩锁 ----
 	bool _desc_rate_warned{false};      ///< MYM_DESC_RATE 被抬高过只告警一次
+	bool _pitch_clamped_warned{false};  ///< MYR_PITCH_DOWN 顶到倾角上限只告警一次
 	bool _takeover_warned{false};       ///< 离开 Offboard 的告警只发一次，回 WAIT 时复位
-	bool _in_offboard{false};           ///< 本拍 nav_state 是不是 OFFBOARD；决定要不要发 trajectory_setpoint
 
 	// ===================================================================
 	// uORB 句柄
 	// ===================================================================
 	// 订阅：Run() 里 copy()/update() 取最新一份
-	//   既然 offboard 位置控制依赖 EKF，位置/姿态/解锁/模式/着地这几条是必须的
 	uORB::Subscription _parameter_update_sub{ORB_ID(parameter_update)};
 	uORB::Subscription _vehicle_status_sub{ORB_ID(vehicle_status)};    // nav_state
 	uORB::Subscription _armed_sub{ORB_ID(actuator_armed)};             // armed / kill / termination
@@ -223,11 +216,6 @@ private:
 	uORB::Subscription _attitude_sub{ORB_ID(vehicle_attitude)};        // 只用来取当前航向
 	uORB::Subscription _land_detected_sub{ORB_ID(vehicle_land_detected)}; // landed 判据
 	uORB::Subscription _manual_control_sub{ORB_ID(manual_control_setpoint)}; // 接管安全：油门杆位置
-
-	// 发布：offboard 的两条 + 一条命令
-	uORB::Publication<offboard_control_mode_s> _ocm_pub{ORB_ID(offboard_control_mode)};
-	uORB::Publication<trajectory_setpoint_s> _traj_sp_pub{ORB_ID(trajectory_setpoint)};
-	uORB::Publication<vehicle_command_s> _vehicle_command_pub{ORB_ID(vehicle_command)};
 
 	// 参数默认值/含义见 my_mission_params.yaml；改完不用重启模块（Run 里 updateParams）
 	DEFINE_PARAMETERS(
@@ -244,6 +232,13 @@ private:
 		(ParamFloat<px4::params::MYM_TKO_TMO>) _param_mym_tko_tmo,
 		(ParamFloat<px4::params::MYM_LAND_TMO>) _param_mym_land_tmo,
 		(ParamInt<px4::params::MYM_AUTO_DISARM>) _param_mym_auto_disarm,
-		(ParamFloat<px4::params::MYM_DISARM_TMO>) _param_mym_disarm_tmo
+		(ParamFloat<px4::params::MYM_DISARM_TMO>) _param_mym_disarm_tmo,
+		(ParamFloat<px4::params::MYR_ANCHOR_X>) _param_myr_anchor_x,
+		(ParamFloat<px4::params::MYR_ANCHOR_Y>) _param_myr_anchor_y,
+		(ParamFloat<px4::params::MYR_ANCHOR_Z>) _param_myr_anchor_z,
+		(ParamFloat<px4::params::MYR_ROPE_LEN>) _param_myr_rope_len,
+		(ParamFloat<px4::params::MYR_ROPE_ANGLE>) _param_myr_rope_angle,
+		(ParamFloat<px4::params::MYR_PITCH_DOWN>) _param_myr_pitch_down,
+		(ParamFloat<px4::params::MYR_TILT_HOLD>) _param_myr_tilt_hold
 	)
 };

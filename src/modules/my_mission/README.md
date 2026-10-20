@@ -11,10 +11,19 @@ Offboard 位置控制的最小任务示例：**起飞到指定高度 → 向前�
 
 ## 文件
 
+代码按职责拆成 6 块，依赖方向是单向的（`MyMission` → 其它，其它之间互不依赖）：
+
 | 文件 | 作用 |
 |---|---|
-| `MyMission.cpp` / `MyMission.hpp` | 模块本体：状态机 + 三条 topic 的发布 |
-| `my_mission_params.yaml` | `MYM_*` 参数定义 |
+| `MyMission.cpp` / `MyMission.hpp` | **任务编排**：状态机 + 9 个状态函数。就是"什么时候做什么" |
+| `MissionConfig.hpp` | `MYM_*` / `MYR_*` 参数的只读快照（POD），子组件不依赖参数框架 |
+| `MissionOutput.cpp` / `.hpp` | **所有出站 topic**（`offboard_control_mode` / `trajectory_setpoint` / `vehicle_command`）。只有它能发 topic |
+| `TransitLeg.cpp` / `.hpp` | "用 PX4 的 `PositionSmoothing` 飞到一个定点"，`FORWARD` 用它 |
+| `RopeGeometry.cpp` / `.hpp` | 系绳几何，**纯函数**：不碰 uORB、不碰参数，输入全来自 `MYR_*` |
+| `ExternalParams.cpp` / `.hpp` | 从别人的参数抄阈值（`MPC_*` / `MAN_DEADZONE` / `LNDMC_Z_VEL_MAX`） |
+| `TakeoverMonitor.cpp` / `.hpp` | 接管安全：飞出 Offboard 时油门没回中会掉高度 |
+| `docs/offboard.md` | Offboard 是什么、三条 topic 怎么配合、飞手操作顺序（原来压在 `MyMission.cpp` 开头的 144 行） |
+| `my_mission_params.yaml` | `MYM_*` / `MYR_*` 参数定义 |
 | `Kconfig` | `MODULES_MY_MISSION` |
 | `CMakeLists.txt` | `px4_add_module` |
 | `PX4_架构通俗版.md` | **人话版** PX4 架构（一个杆量怎么变成电机转速；含本项目踩过的坑） |
@@ -27,11 +36,23 @@ Offboard 位置控制的最小任务示例：**起飞到指定高度 → 向前�
 ## 状态机
 
 ```
-WAIT ──手势解锁 + 进 Offboard──> TAKEOFF ──到达 MYM_ALT──> [FORWARD ──到达前方点──>] HOVER
+WAIT ──手势解锁 + 进 Offboard──> TAKEOFF ──到达 MYM_ALT──>
+       目的地 = 绳 ? 绷紧点 : 前方点
+       ├─ 有目的地 ──> FORWARD ──到位──> 绳 ? TILT ──MYR_TILT_HOLD 秒──> : HOVER
+       └─ 没目的地 ─────────────────────> HOVER
      ──MYM_HOVER 秒──> LAND ──> DISARM ──> DONE ──(已上锁)──> WAIT（可以再跑一遍）
 ```
 
-`FORWARD` 只在 `MYM_FWD_DIST > 0` 时插入；`= 0` 时跳过，行为跟没有这个功能时完全一样。
+**目的地只有一个，在 `TAKEOFF` 到位那一刻二选一，之后不再改：**
+
+| 配置 | `FORWARD` 飞向 | 到位之后 |
+|---|---|---|
+| `MYR_ROPE_LEN > 0` | **绷紧点**（斜距正好 = 绳长的位置），`MYM_FWD_DIST` / `MYM_FWD_DIR` **失效** | `TILT`（低头，保持 `MYR_TILT_HOLD` 秒） |
+| 绳关 + `MYM_FWD_DIST > 0` | 起飞点沿 `航向 + MYM_FWD_DIR` 前方 `MYM_FWD_DIST` 米 | `HOVER`（`MYM_HOVER` 秒） |
+| 绳关 + `MYM_FWD_DIST = 0` | 不飞，`FORWARD` 整段跳过 | 直接 `HOVER` |
+
+绳优先是**硬性**的：两个参数都配了也只去绷紧点。目的地类型同时闩锁进 `_rope_leg`，
+**飞行途中改 `MYR_ROPE_LEN` 不会改变本次任务去哪**，也不会让到达动作和目的地错配。
 
 实际的操作顺序（先切模式再解锁、手势怎么做、要设哪些参数）见下面
 [操作顺序](#操作顺序先切-offboard再用手势解锁) 一节。
@@ -40,7 +61,8 @@ WAIT ──手势解锁 + 进 Offboard──> TAKEOFF ──到达 MYM_ALT──
   这一步是让 commander 认为 "Offboard 可用"，**必须在切进 Offboard 之前就开始发**。
   进 `TAKEOFF` 时把当前航向锁进 `_takeoff_yaw`，后面 `FORWARD` 用它算"前方"。
 - `TAKEOFF`：目标 = 进入点上方 `MYM_ALT`，NED 里就是 `z = 进入时 z - MYM_ALT`（向上为负）。
-- `FORWARD`：终点 = **起飞点** 沿 `_takeoff_yaw + MYM_FWD_DIR` 前方 `MYM_FWD_DIST` 米，高度不变。
+- `FORWARD`：飞向 `TAKEOFF` 到位时选定的**唯一目的地**（绷紧点 或 前方点）。前方点的算法：
+  终点 = **起飞点** 沿 `_takeoff_yaw + MYM_FWD_DIR` 前方 `MYM_FWD_DIST` 米，高度不变。
     - 机头单位向量在 NED 里是 `(cos ψ, sin ψ)`：ψ 的定义是"从北起顺时针为正"，
       而 NED 的 x 指北、y 指东，x→y 也是顺时针 —— **两个角度系统重合，不用转负号**。
     - 起点固定用起飞点（不是"当前位置"），所以同一个场地跑几次都落在同一点。
@@ -53,10 +75,15 @@ WAIT ──手势解锁 + 进 Offboard──> TAKEOFF ──到达 MYM_ALT──
     - 到位判据 = **轨迹**贴住终点（`MYM_ARRIVE`）**且飞机**速度 < 0.3 m/s。
     - 超时 `MYM_FWD_TMO` → 直接转 `LAND`（和起飞超时同样的策略：不硬追）。
 - `HOVER`：保持同一 setpoint `MYM_HOVER` 秒。
+- 绳段的终点是**绷紧点** —— 到锚点的斜距正好等于 `MYR_ROPE_LEN`、绳和地面夹角正好等于
+  `MYR_ROPE_ANGLE` 的那个位置。它和前方点走的是**同一个 `FORWARD` 状态**（同一个
+  `PositionSmoothing`、同一个 `MYM_FWD_TMO`），只是终点不同。
+  几何见下面 [系绳测试](#系绳测试rope--tilt)。
+- `TILT`：停在绷紧点，按 `MYR_PITCH_DOWN` 低头，**高度不变**，保持 `MYR_TILT_HOLD` 秒。
 - `LAND`：`MYM_LAND_MODE=1` 发 `MAV_CMD_NAV_LAND` 交给 PX4 AUTO_LAND；`=0` 则纯 Offboard 把 z 以
   `MYM_DESC_RATE` 抬回地面参考。
 - `DISARM`：发 `MAV_CMD_COMPONENT_ARM_DISARM(param1=0)`，等 `!armed`。
-- 全程只要在起飞/前飞/悬停阶段掉出 Offboard 或上锁，立即中止回 `DONE`。
+- 全程只要在起飞/前飞/绳段/低头/悬停阶段掉出 Offboard 或上锁，立即中止回 `DONE`。
 
 > ⚠ **"前方"完全由航向估计决定**（GPS 双天线 / 磁罗盘 / EKF）。航向歪多少度，飞出去就歪多少度，
 > 而且 `MYM_FWD_DIST` 越大偏得越远（3 m 上偏 30° ≈ 1.5 m）。
@@ -72,7 +99,7 @@ WAIT ──手势解锁 + 进 Offboard──> TAKEOFF ──到达 MYM_ALT──
 | `MYM_FWD_SPD` | 0.5 m/s | 前飞巡航速度（对地）。位置目标是按这个速度**推**过去的，不是一步跳过去 |
 | `MYM_FWD_ACC` | 1.0 m/s² | 前飞加/减速上限。**决定姿态变化大小**：平飞倾角 ≈ `atan(加速度/9.81)`，1.0 → ≈6° |
 | `MYM_FWD_TMO` | 20 s | 前飞超时 → 直接转降落。斜坡比阶跃慢，改小 `MYM_FWD_SPD` 时要一起放大 |
-| `MYM_HOVER` | 5.0 s | 到达目标点后的悬停时间 |
+| `MYM_HOVER` | 5.0 s | 到达**前方点**后的悬停时间（绳开时用 `MYR_TILT_HOLD`，不用这个） |
 | `MYM_LAND_MODE` | 1 | 0 = Offboard 下降，1 = PX4 AUTO_LAND |
 | `MYM_DESC_RATE` | 0.4 m/s | Offboard 下降速率（仅 mode 0）。**会被强制抬到 ≥ `1.1 × LNDMC_Z_VEL_MAX`（0.275 m/s）**，否则 land detector 判不出"被指令下降"，`landed` 永远上不去 → 上不了锁 |
 | `MYM_ARRIVE` | 0.20 m | 到位判定半径（同时要求速度 < 0.3 m/s） |
@@ -80,6 +107,93 @@ WAIT ──手势解锁 + 进 Offboard──> TAKEOFF ──到达 MYM_ALT──
 | `MYM_LAND_TMO` | 40 s | 降落超时 → 转去上锁 |
 | `MYM_AUTO_DISARM` | 1 | 着地后由本模块发 disarm |
 | `MYM_DISARM_TMO` | 10 s | 上锁超时 |
+
+## 系绳测试（走 `FORWARD` + `TILT`）
+
+把飞机用一根定长绳拴在地面锚点上，飞到"绳子刚好绷直、还没受力"的位置，
+然后低头一个固定角度、高度不变。用来测系留状态下的姿态/拉力。
+
+**默认关闭**（`MYR_ROPE_LEN = 0`），关闭时行为和原来完全一样。
+
+打开后它**不新增状态**：只是把 `FORWARD` 的目的地从"前方点"换成"绷紧点"，到位后进 `TILT` 而不是 `HOVER`。
+
+### 几何：三个点
+
+```
+锚点     = 起飞点 + 地面机体系(MYR_ANCHOR_X, MYR_ANCHOR_Y, MYR_ANCHOR_Z)
+                    地面机体系 = 去掉倾斜的机体系：X 前 / Y 右 / Z 下
+                    （和 NED 一样向下为正，所以 MYR_ANCHOR_Z 一般填 0）
+绷紧点   = 锚点 + 沿起飞航向 L*cos(θ)  +  往上 L*sin(θ)
+                    L = MYR_ROPE_LEN，θ = MYR_ROPE_ANGLE
+```
+
+绷紧点到锚点的斜距**正好等于 L**、绳和地面的夹角**正好等于 θ** ——
+"刚好拉直、张力为零"。再往前一点绳才开始出力，所以它是"快要拉紧"的那个点。
+水平方位取**起飞航向**（不是"锚点→飞机"的方位）；`MYR_ANCHOR_X/Y = 0` 时两者一样。
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `MYR_ANCHOR_X` | 0 m | 锚点前后（机体系，前为正） |
+| `MYR_ANCHOR_Y` | 0 m | 锚点左右（机体系，右为正） |
+| `MYR_ANCHOR_Z` | 0 m | 锚点高低（机体系，**下为正**；地面锚点填 0） |
+| `MYR_ROPE_LEN` | 0 m | 绳长。**0 = 关闭系绳段**；>0 时接管 `FORWARD` 的目的地 |
+| `MYR_ROPE_ANGLE` | 30 deg | 绷紧时绳和地面的夹角；决定绷紧点的高度 L·sinθ |
+| `MYR_PITCH_DOWN` | 15 deg | 到绷紧点后低头多少度（正 = 低头）。0 = 不低头，但仍保持 `MYR_TILT_HOLD` 秒 |
+| `MYR_TILT_HOLD` | 10 s | 绷紧点上低头**保持多久**。和 `MYM_HOVER` 完全独立 |
+
+### 低头是怎么实现的
+
+本模块发的是 position 型 offboard，**姿态是位置环的输出**，没法直接指定。
+但 `trajectory_setpoint.acceleration` 会被原样加进加速度指令
+（`PositionControl.cpp:153`），而加速度到姿态的映射是
+
+```
+body_z = -(a_x, a_y, g - a_z) 归一化        # _accelerationControl, :222
+=> 平飞倾角 = atan(a / g)
+```
+
+所以 `TILT` 只是每拍发一个沿起飞航向的加速度前馈 `a = g*tan(MYR_PITCH_DOWN)`，
+z 给 NaN（不做前馈，让位置环自己维持高度）。低头之后升力的水平分量把飞机往前推，
+但**绳已经绷紧、拉住了**，飞机几乎不前进 → 位置误差 ≈ 0 → 位置/速度环不额外出力
+→ 稳态姿态就是 φ。
+
+> ⚠ **没有绳就没有低头。** 如果 gz 那边没开 `GZ_TETHER`，飞机在 `TILT` 里会被
+> 这个前馈推着往前飞，位置环把它拉回来，最后停在一个**水平**的平衡点上（而且落在
+> 绷紧点后面几米）。看到"到了绷紧点却不低头"先查这个。
+
+实测（`MYR_ROPE_LEN=10`、`MYR_ROPE_ANGLE=30`、`MYR_PITCH_DOWN=15`、`MYR_TILT_HOLD=12`）：
+
+| 量 | 理论 | 实测 |
+|---|---|---|
+| 斜距 | 10.00 m | **9.99 m** |
+| 水平距离 | 8.66 m | 8.68 m |
+| 高度 | 5.00 m | **4.95 m**（12 秒内保持不漂） |
+| 绳角 | 30.0° | 29.7° |
+| 低头角 | 15.0° | **13.5°**（见下） |
+| 推力电机指令 | — | 0（位置误差≈0，没有"缺额"可用） |
+
+**低头角会差 1~2 度。** 稳态姿态不仅由前馈决定，速度环的积分项也会加进来：
+飞到绷紧点的末端飞机被绳"接住"时有一次速度扰动，积分器留下一点约 −0.27 m/s² 的残余，
+把总加速度从 2.63 拉低到 2.35 → 13.5°。残余量取决于当次进场的瞬态，所以：
+**把 `MYR_PITCH_DOWN` 当成"±1.5° 的设定值"用**，要精确角度就在这个基础上补。
+
+### 和 gz 的 TetherPlugin 配套
+
+绳子的物理在仿真里由 `Tools/simulation/gz/models/towed/model.sdf` 里的
+`TetherPlugin`（单边弹簧 + 阻尼）提供。**两边必须填同一个绳长**，否则
+要么绳一直松着（飞控以为到了），要么飞过头被拽回来：
+
+```bash
+export GZ_TETHER=1          # 打开绳子（插件默认关，否则所有测试都被拴住）
+export GZ_TETHER_LEN=10     # 必须等于 MYR_ROPE_LEN
+HEADLESS=1 make px4_sitl gz_towed
+```
+
+`MYR_ANCHOR_* = 0` 对应 SDF 里的 `<anchor_offset>0 0 0</anchor_offset>`；
+非 0 时要按**世界坐标**改 `anchor_offset`（gz 世界系是 ENU：x 东、y 北、z 上）。
+
+对表：`TILT` 每秒打一行 `slant / rope angle`，和插件遥测
+`gz topic -e -t /towed_0/tether`（x=张力[N] y=斜距[m] z=绳角[deg]）直接对照。
 
 ## 操作顺序：先切 Offboard，再用手势解锁
 

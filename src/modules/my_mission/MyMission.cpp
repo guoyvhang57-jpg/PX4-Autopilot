@@ -21,126 +21,17 @@
 /**
  * @file MyMission.cpp
  *
- * Offboard 位置控制的最小任务示例。下面按"是什么 → 为什么 → 怎么走"把 PX4 的
- * offboard 讲清楚。
+ * 任务编排：状态机 + 9 个状态函数。
  *
- * ===========================================================================
- * 1. 什么叫 "Offboard"
- * ===========================================================================
- * Offboard 不是一个具体的控制器，而是"**由外部源提供 setpoint**"的一种模式。
- * 这个"外部源"可以是机载电脑，也可以是**飞控上的一个模块**（本模块就是），
- * 所以做这件事**不需要机载电脑**。
+ * Offboard 是什么、三条 topic 怎么配合、飞手要按什么顺序操作、每个参数什么含义，
+ * 全部在 docs/offboard.md 和 README.md 里，本文件只管"什么时候做什么"。
  *
- * commander 认不认这个模式，只看两件事：
- *
- *   a) vehicle_status.nav_state == NAVIGATION_STATE_OFFBOARD
- *      飞手用模式开关（COM_FLTMODE<n> = 7）或 MAVLink 切进来。
- *      本模块**不自己切模式**。
- *
- *   b) offboard_control_mode 这条 topic 有新数据：至少一个 flag 为 true，
- *      且 timestamp 距今 < COM_OF_LOSS_T（默认 1.0 s）
- *      → commander/HealthAndArmingChecks/checks/offboardCheck.cpp:49-54
- *
- * 关键结论：(b) 必须在切进 Offboard **之前**就满足，否则模式开关根本切不进去；
- * 切进去之后也必须一直满足，断了就触发 offboard signal lost failsafe，
- * 按 COM_OBL_RC_ACT（默认 0 = Position）把飞机切走。
- * 这就是本模块从 start 起就 50 Hz 一直发 offboard_control_mode 的原因。
- *
- * ===========================================================================
- * 2. offboard_control_mode 决定"交给哪一级控制器"
- * ===========================================================================
- * PX4 不看你"想要什么姿态"，只看这条 topic 里哪个 flag 被置位
- * （commander/ModeUtil/control_mode.cpp:111-129）：
- *
- *   position      = true → SetpointType::Trajectory
- *                          allocation / rates / attitude / altitude / velocity /
- *                          position / climb_rate 七组 flag 全开
- *                          → mc_pos_control 接管位置环，吃 trajectory_setpoint
- *   velocity      = true → 同上，但关掉 position（只控速度）
- *   acceleration  = true → 只要加速度，再关掉 position/altitude/climb_rate
- *   attitude      = true → SetpointType::Attitude，mc_att_control 直接吃，
- *                          位置环闭嘴（towed_control 用的就是这个）
- *
- * 本模块置 position = true。于是控制链是：
- *
- *   本模块 ──trajectory_setpoint──> mc_pos_control ──vehicle_attitude_setpoint──>
- *   mc_att_control ──vehicle_rates_setpoint──> mc_rate_control ──torque/thrust──>
- *   control_allocator ──actuator_motors──> 输出驱动（SITL: gz_bridge / 真机: pwm_out）
- *
- * ===========================================================================
- * 3. trajectory_setpoint 的约定（三个最容易写错的点）
- * ===========================================================================
- *   a) 坐标系是 **NED**：x 北、y 东、**z 向下**。
- *      所以"上升 1 m"是 position[2] = -1.0。符号写反，飞机会往地里扎。
- *   b) 单位是 m / m/s / m/s²，都是**位置环的输入**，不是电机量、不是角度。
- *   c) **NaN = 该通道不受控**（TrajectorySetpoint.msg 里明确写了）。
- *      本模块只写 position，velocity / acceleration / jerk 全给 NaN，
- *      让位置环自己规划速度。"给 0"是另一个意思：要求速度必须为 0。
- *
- * ===========================================================================
- * 4. position 型 Offboard 的额外前提
- * ===========================================================================
- * offboardCheck.cpp:56 要求 local position 有效（EKF 有位置估计），
- * 否则这个模式会被 arming check 直接禁掉。所以本模块在位置无效时：
- *   - 不发布位置（位置发 NaN，见 publishTrajectorySetpoint）
- *   - 绝不切进 TAKEOFF
- *
- * ===========================================================================
- * 5. 状态机 + 飞手操作顺序
- * ===========================================================================
- *   WAIT ──arm + 进 Offboard──> TAKEOFF ──到 MYM_ALT──> [FORWARD ──到前方点──>] HOVER
- *        ──MYM_HOVER 秒──> LAND ──> DISARM ──> DONE ──(已上锁)──> WAIT（可以再跑一遍）
- *
- *   FORWARD 只在 MYM_FWD_DIST > 0 时插入（= 0 时行为跟以前完全一样）。
- *   终点 = **起飞点** 沿"起飞那一刻锁定的机头方向"前方 MYM_FWD_DIST 米，
- *   MYM_FWD_DIR 再叠一个相对偏角（0 = 正前方，+90 = 右侧）。见 Run() 的 TAKEOFF 分支。
- *
- *   ⚠ 位置目标**不是**一步跳到终点的：TAKEOFF 只把终点记进 _fwd_goal，
- *     FORWARD 状态每拍把 _target 朝它推 MYM_FWD_SPD * dt（MYM_FWD_ACC 限加减速，
- *     走"加速-匀速-减速"梯形曲线），同时把该速度作为 velocity 前馈发出去。
- *     一步跳过去的话，位置环会瞬间要求 (跳跃距离 * MPC_XY_P) 那么大的速度，
- *     姿态猛压甚至顶到倾角上限 —— 这个坑见 FORWARD case 开头的长注释。
- *
- *   ⚠ "正前方"完全由**航向估计**决定（GPS 双天线 / 磁罗盘 / EKF）。航向歪多少度，
- *     飞出去的方向就歪多少度，而且 MYM_FWD_DIST 越大偏得越远（3 m 上偏 30° = 1.5 m）。
- *     所以第一次调这个参数时：MYM_FWD_DIST 先给小（1~2 m），MYM_ALT 给高（≥2 m），
- *     在开阔场地、飞机朝向你、随时能切回 Position 的状态下试。
- *
- * 本模块不自己 arm、也不自己切模式，只检测 (armed && offboard && 位置有效)。
- * 所以飞手要按这个顺序来（顺序不能反，原因见 §1 的关键结论）：
- *
- *   1) 等位置有效 —— position 型 Offboard 的硬前提（§4）
- *   2) 模式开关切到 Offboard 档（COM_FLTMODE<n> = 7）
- *      此时还没解锁是正常的：本模块从 start 起就 50 Hz 发 offboard_control_mode，
- *      commander 因此允许在未解锁状态下就切进 Offboard。
- *   3) **遥控器手势解锁**：左杆油门最低 + 偏航打满右 + 右杆回中，保持 1 s
- *      （退锁同位置、偏航打满左。1 s 是 manual_control 里 _stick_arm_hysteresis
- *        的固定迟滞；判定在 ManualControl::processStickArming）
- *      → 一旦 armed，WAIT 的三个条件齐了，立刻进 TAKEOFF 自动起飞。
- *   4) 任务跑完模块自己上锁（DISARM 是唯一由本模块发起的动作），
- *      飞手把模式开关拨回去。飞行中途也可以用手势退锁来中止：
- *      armed 变 false 后 §2 的安全兜底会把状态踢到 DONE。
- *
- * 手势解锁能成立的前提（airframe 里已写成默认值，但飞控上已经存过的参数
- * 不会被 param set-default 覆盖，必须手动核对一次）：
- *
- *   RC_MAP_ARM_SW = 0       否则 manual_control::updateParams 启动时会把
- *                           MAN_ARM_GESTURE 自动改成 0，手势直接没有
- *   MAN_ARM_GESTURE = 1     手势总开关
- *   MAN_OVERRIDE_SPD < 0    否则解锁后把偏航杆回中会被判成 sticks_moving，
- *                           commander 立刻切到 Position 模式 -> 掉出 Offboard
- *                           -> 本模块的安全兜底把任务中止。
- *                           （v1.17 固件上对应的开关是 COM_RC_OVERRIDE，
- *                             默认 1 = 只有 auto 模式可被摇杆接管、offboard
- *                             不接管，所以 v1.17 上不用改这一项。）
- *   MC_AIRMODE != 2         偏航 airmode 也会强制禁用手势
- *
- * ===========================================================================
- * 6. 和 towed_control 的冲突（重要）
- * ===========================================================================
- * offboard_control_mode 是**单实例** topic。towed_control 也在发它（attitude=true）。
- * 两个模块同时跑 = 互相覆盖，commander 只认"最后写进去"的那一份。
- * 所以 airframe 里只自启一个；要切换必须先 stop 掉另一个。
+ * 刻意留下的两条规矩：
+ *   1) **只有 MissionOutput 发 topic。** trajectory_setpoint 是共享 topic，
+ *      非 Offboard 时发它会把 land detector 搞坏（见 MissionOutput.cpp）。
+ *   2) **状态函数自己改 _state / _state_start。** 不统一走"返回下一个状态"，
+ *      因为现有代码里有几处迁移顺带做了别的事，而且 Disarm→Done 是故意不刷
+ *      _state_start 的。保持"纯搬迁"，行为一个字节都不变。
  */
 
 #include "MyMission.hpp"
@@ -149,10 +40,7 @@
 
 #include <lib/geo/geo.h>   // CONSTANTS_ONE_G：算"加速度对应多大倾角"用
 
-#include <px4_platform_common/events.h>
-#include <px4_platform_common/getopt.h>
 #include <px4_platform_common/log.h>
-#include <px4_platform_common/posix.h>
 
 ModuleBase::Descriptor MyMission::desc{task_spawn, custom_command, print_usage};
 
@@ -175,8 +63,8 @@ bool MyMission::init()
 	//   工作队列被别的模块占用时，1 s 的窗口其实很容易踩线。
 	ScheduleOnInterval(20_ms);
 
-	// 接管安全的油门中位判据跟着 PX4 走：具体阈值来自 MAN_DEADZONE（默认 0.1）
-	updateExternalParams();
+	refreshConfig();
+	_external.refresh();
 
 	return true;
 }
@@ -190,6 +78,8 @@ const char *MyMission::stateName(State state)
 
 	case State::Forward: return "FORWARD";
 
+	case State::Tilt:    return "TILT";
+
 	case State::Hover:   return "HOVER";
 
 	case State::Land:    return "LAND";
@@ -197,12 +87,14 @@ const char *MyMission::stateName(State state)
 	case State::Disarm:  return "DISARM";
 
 	case State::Done:    return "DONE";
+
+	case State::Count:   break;
 	}
 
 	return "?";
 }
 
-bool MyMission::localPositionValid(const vehicle_local_position_s &pos, hrt_abstime now) const
+bool MyMission::localPositionValid(const vehicle_local_position_s &pos, hrt_abstime now)
 {
 	// xy_valid / z_valid 是 EKF 给的"这两个通道现在能不能信"。
 	// 再加一个 500 ms 的新鲜度判断：EKF 挂了之后 topic 还在，
@@ -221,7 +113,7 @@ bool MyMission::reachedTarget(const vehicle_local_position_s &pos) const
 
 	// 到位 = 位置误差小 **且** 速度也小。
 	// 只判位置的话，飞过目标点的那一瞬间误差也是 0，会被误判成"到了"。
-	return (p - _target).norm() < _param_mym_arrive.get() && v.norm() < 0.3f;
+	return (p - _target).norm() < _config.arrive && v.norm() < 0.3f;
 }
 
 void MyMission::holdCurrentPosition(const vehicle_local_position_s &pos, const vehicle_attitude_s &att, bool pos_valid)
@@ -240,291 +132,152 @@ void MyMission::holdCurrentPosition(const vehicle_local_position_s &pos, const v
 	_yaw_sp = matrix::Eulerf(matrix::Quatf(att.q)).psi();
 }
 
-void MyMission::publishOffboardControlMode(hrt_abstime now)
+MissionOutput::Setpoint MyMission::targetSetpoint() const
 {
-	offboard_control_mode_s ocm{};
+	MissionOutput::Setpoint setpoint;
 
-	// timestamp 必须**每拍刷新**：commander 就是靠
-	// "now - ocm.timestamp < COM_OF_LOSS_T" 判断外部信号还在不在。
-	// 只发一次、或者忘了刷时间戳，都会被判成 offboard signal lost。
-	ocm.timestamp = now;
-
-	// 唯一要置的 flag。它同时决定两件事：
-	//   1) commander 认为 "offboard available" —— 只要**任意一个** flag 为 true 就够
-	//   2) 进去之后 mc_pos_control 接管位置环 —— control_mode.cpp:114
-	//
-	// 其余 velocity / acceleration / attitude / body_rate / thrust_and_torque /
-	// direct_actuator 必须保持 false：commander 是**按顺序**取第一个为 true 的分支
-	// （control_mode.cpp:111-129），同时置多个会选中你没想到的那个。
-	ocm.position = true;
-	_ocm_pub.publish(ocm);
-}
-
-void MyMission::publishTrajectorySetpoint(hrt_abstime now, float z_velocity, const matrix::Vector2f &xy_velocity,
-		const matrix::Vector3f &position_override, const matrix::Vector3f &acceleration)
-{
-	// ===================================================================
-	// 只在真正处于 Offboard 时才发 —— 这不是优化，是正确性要求
-	// ===================================================================
-	// trajectory_setpoint 是**共享** topic，非 Offboard 时它是
-	//   FlightModeManager → mc_pos_control
-	// 的通道，而且 **land detector 也在读它**来判断"是否被指令下降"
-	//   MulticopterLandDetector.cpp:248
-	//     _in_descend = PX4_ISFINITE(tsp.velocity[2]) && (velocity[2] >= 1.1 * LNDMC_Z_VEL_MAX)
-	//   随后 ground_contact &= _in_descend
-	//
-	// 本模块的 setpoint 是 position-only、velocity = NaN。如果在 WAIT/DONE 里
-	// 也照发（这两状态在飞手手动飞的时候一直存在），就会和飞行任务的有限速度
-	// setpoint 交替占坑：land detector 每读到一份 NaN 就把 _in_descend 打成 false，
-	// ground_contact 永远锁不上 → maybe_landed/landed 永远为 0
-	// → 所有上锁方式（手势、解锁开关、QGC 按钮、COM_DISARM_LAND）全部被拒。
-	//
-	// 实测 ulg log_0_2026-10-8-12-03-46.ulg（POSCTL 手动落地后手势退锁失败）：
-	//   trajectory_setpoint.velocity[2] 有 25% 的样本是 NaN，与任务的 0.700 交替；
-	//   vehicle_land_detected.in_descend 逐拍 0/1 翻转；landed 全程为 0。
-	// 而 FlightTaskManualPosition/ManualAltitude 从不把 velocity 置 NaN，
-	// 所以那些 NaN 只可能来自本模块。
-	if (!_in_offboard) {
-		return;
+	// 还没有有效位置估计 → 位置保持 NaN（= 不控制位置），
+	// 千万不要发 (0,0,0)：那会被理解成"飞到 EKF 原点"。
+	// Setpoint 的默认值就是全 NaN，所以这里只在有效时覆盖。
+	if (_target_valid) {
+		setpoint.position = _target;
 	}
 
-	trajectory_setpoint_s tsp{};
-	tsp.timestamp = now;
+	setpoint.yaw = _yaw_sp;
 
-	// ---- 位置（NED，向上为负）----
-	// 优先用覆盖值：FORWARD 里那是 PositionSmoothing 生成的完整三维轨迹。
-	// 它一定有效（平滑器内部有状态，而且进 FORWARD 前已经确认过位置估计可用），
-	// 所以不走 _target_valid 那个分支。
-	if (PX4_ISFINITE(position_override(0))) {
-		tsp.position[0] = position_override(0);
-		tsp.position[1] = position_override(1);
-		tsp.position[2] = position_override(2);
+	return setpoint;
+}
 
-	} else if (_target_valid) {
-		tsp.position[0] = _target(0);
-		tsp.position[1] = _target(1);
-		tsp.position[2] = _target(2);
+void MyMission::refreshConfig()
+{
+	_config.alt = _param_mym_alt.get();
+	_config.fwd_dist = _param_mym_fwd_dist.get();
+	_config.fwd_dir_deg = _param_mym_fwd_dir.get();
+	_config.fwd_spd = _param_mym_fwd_spd.get();
+	_config.fwd_acc = _param_mym_fwd_acc.get();
+	_config.fwd_tmo = _param_mym_fwd_tmo.get();
+	_config.hover = _param_mym_hover.get();
+	_config.land_mode = _param_mym_land_mode.get();
+	_config.desc_rate = _param_mym_desc_rate.get();
+	_config.arrive = _param_mym_arrive.get();
+	_config.tko_tmo = _param_mym_tko_tmo.get();
+	_config.land_tmo = _param_mym_land_tmo.get();
+	_config.auto_disarm = (_param_mym_auto_disarm.get() != 0);
+	_config.disarm_tmo = _param_mym_disarm_tmo.get();
+
+	_config.rope.anchor_offset_body = matrix::Vector3f(_param_myr_anchor_x.get(), _param_myr_anchor_y.get(),
+					  _param_myr_anchor_z.get());
+	_config.rope.rope_length = _param_myr_rope_len.get();
+	_config.rope.rope_angle_deg = _param_myr_rope_angle.get();
+	_config.pitch_down_deg = _param_myr_pitch_down.get();
+	_config.tilt_hold = _param_myr_tilt_hold.get();
+}
+
+// ===========================================================================
+// 中转：FORWARD 和 ROPE 共用的"用 TransitLeg 飞到 _goal3"
+// ===========================================================================
+TransitLeg::Limits MyMission::transitLimits() const
+{
+	TransitLeg::Limits limits;
+
+	limits.cruise_speed = _config.fwd_spd;
+	limits.accel_xy = _config.fwd_acc;
+	limits.vel_xy_max = _external.mpcXyVelMax();
+	limits.jerk = _external.mpcJerkAuto();
+	limits.err_max_xy = _external.mpcXyErrMax();
+	limits.err_max_z = _external.mpcZErrMax();
+	limits.vel_z_max = _external.mpcZvAutoUp();
+	limits.accel_z_max = _external.mpcAccUpMax();
+
+	return limits;
+}
+
+void MyMission::enterTransit(const Tick &tick, State next)
+{
+	_transit.setLimits(transitLimits());
+	_transit.start(_goal3, tick.pos);
+
+	enterState(next, tick.now);
+}
+
+bool MyMission::advanceTransit(const Tick &tick)
+{
+	const TransitLeg::Update u = _transit.update(tick.pos, tick.dt);
+
+	// 位置、速度、**加速度**三个量一起发。加速度这一项是修掉末端过冲的关键：
+	// PositionControl.cpp:153 把它直接加进加速度指令，绕过了速度环那个
+	// τ ≈ 0.56 s 的一阶滞后。没有它，参考做匀速减速时飞机永远比参考快 a·τ，
+	// 到终点时早就冲过去了（实测 0.39~0.45 m）。
+	MissionOutput::Setpoint setpoint;
+	setpoint.position = u.position;
+	setpoint.velocity_xy = u.velocity_xy;
+	setpoint.acceleration = u.acceleration;
+	setpoint.yaw = _yaw_sp;
+	publishSetpoint(setpoint, tick.now);
+
+	// 让 HOVER / LAND / print_status 接着用同一个位置
+	_target = u.position;
+	_goal_distance = u.goal_distance;
+
+	// 到位判据两件事都要满足：
+	//   1) **轨迹**已经贴住终点。平滑器的速度上限是按剩余距离反解的，
+	//      所以"位置到终点"和"速度归零"本来就是同一件事（TrajMath.hpp:61-71）。
+	//   2) **飞机**的速度也小。轨迹到了不等于飞机到了，中间还有跟踪误差。
+	const matrix::Vector3f v(tick.pos.vx, tick.pos.vy, tick.pos.vz);
+
+	return _transit.arrived(_config.arrive) && (v.norm() < 0.3f);
+}
+
+// ===========================================================================
+// 系绳测试
+// ===========================================================================
+void MyMission::solveRope()
+{
+	// 几何一次算定：只依赖起飞点、起飞航向和 MYR_*，之后不再变。
+	// 之后不管是 TAKEOFF 直接过去、还是先 FORWARD 再过去，用的都是同一份锚点/绷紧点，
+	// 不会因为中途改参数而前后不一致。
+	_rope.setConfig(_config.rope);
+	_rope_solution = _rope.solve(_takeoff_pos, _takeoff_yaw);
+}
+
+void MyMission::logTransitStart(const Tick &tick)
+{
+	// 目的地只有一个，"是哪一种"由 _rope_leg 决定（TAKEOFF 到位时闩锁的）。
+	const matrix::Vector3f here(tick.pos.x, tick.pos.y, tick.pos.z);
+	const float dist = (_goal3 - here).norm();
+	const float climb = tick.pos.z - _goal3(2);   // NED：正 = 要往上爬
+	const float t_est = TransitLeg::estimateDuration(dist, _config.fwd_spd, _config.fwd_acc);
+
+	if (_rope_leg) {
+		PX4_INFO("my_mission: FORWARD -> taut point [%.2f %.2f %.2f], anchor [%.2f %.2f %.2f] (rope %.1f m at %.0f deg)",
+			 (double)_goal3(0), (double)_goal3(1), (double)_goal3(2),
+			 (double)_rope_solution.anchor(0), (double)_rope_solution.anchor(1),
+			 (double)_rope_solution.anchor(2),
+			 (double)_config.rope.rope_length, (double)_config.rope.rope_angle_deg);
 
 	} else {
-		// 还没有有效位置估计 → 位置发 NaN（= 不控制位置）。
-		// 千万不要发 (0,0,0)：那会被理解成"飞到 EKF 原点"。
-		tsp.position[0] = NAN;
-		tsp.position[1] = NAN;
-		tsp.position[2] = NAN;
+		PX4_INFO("my_mission: FORWARD %.2f m at %.0f deg (heading %.0f deg) -> target [%.2f %.2f]",
+			 (double)_config.fwd_dist, (double)_config.fwd_dir_deg,
+			 (double)math::degrees(_takeoff_yaw), (double)_goal3(0), (double)_goal3(1));
 	}
 
-	// ---- 其余通道全部"不控制" ----
-	// NaN 的语义是"这个状态不要你管"，位置环会自己规划出可行的速度/加速度。
-	// 只写 position、其余全 NaN，是最常见也最安全的 offboard 位置用法。
-	for (int i = 0; i < 3; i++) {
-		tsp.velocity[i] = NAN;
-		tsp.acceleration[i] = NAN;
-		tsp.jerk[i] = NAN;
+	PX4_INFO("my_mission: %.1f m to go (climb %.1f m), cruise %.2f m/s acc %.2f m/s^2 jerk %.2f, "
+		 "est %.1f s (tilt ~%.0f deg)",
+		 (double)dist, (double)climb, (double)_config.fwd_spd, (double)_config.fwd_acc,
+		 (double)_external.mpcJerkAuto(), (double)t_est,
+		 (double)math::degrees(atanf(_config.fwd_acc / CONSTANTS_ONE_G)));
+
+	// 飞绷紧点时这段比前飞长得多（水平 L*cosθ + 竖直 L*sinθ），MYM_FWD_TMO 沿用
+	// 前飞那个值时很容易半路超时 —— 超时会直接转降落，看起来像"绳子还没拉紧就下来了"。
+	if (t_est > _config.fwd_tmo) {
+		PX4_WARN("my_mission: est %.1f s > MYM_FWD_TMO %.1f s -> will time out; "
+			 "raise MYM_FWD_TMO or MYM_FWD_SPD", (double)t_est, (double)_config.fwd_tmo);
 	}
-
-	// ---- 加速度前馈（只有平滑器给）----
-	// 这是修掉末端过冲的关键一项。PositionControl 把它**直接**放进加速度指令
-	// （PositionControl.cpp:106 取值、:153 与速度环输出相加），不经过速度环的
-	// 一阶滞后（τ = 1/MPC_XY_VEL_P_ACC ≈ 0.56 s）。没有它，参考做匀速减速时
-	// 飞机会一直比参考快 a·τ，到终点时已经冲过去了。
-	for (int i = 0; i < 3; i++) {
-		if (PX4_ISFINITE(acceleration(i))) {
-			tsp.acceleration[i] = acceleration(i);
-		}
-	}
-
-	// ---- 可选的水平速度前馈（只有 FORWARD 的斜坡用）----
-	// 位置环的结构是 vel_sp = 速度前馈 + MPC_XY_P * 位置误差（两者相加），
-	// 前馈给成"setpoint 当前正在移动的速度"，位置误差就≈0，飞机精确跟着
-	// setpoint 走：既不会因为追不上而滞后，也不会在停的时候冲过去。
-	//
-	// 只写 velocity[0] / velocity[1]，**不碰 velocity[2]** —— land detector 的
-	// _in_descend 只读 velocity[2]（MulticopterLandDetector.cpp:248），
-	// 所以给水平前馈不会像"位置-only 的 NaN 速度"那样把着陆检测搞坏。
-	if (PX4_ISFINITE(xy_velocity(0)) && PX4_ISFINITE(xy_velocity(1))) {
-		tsp.velocity[0] = xy_velocity(0);
-		tsp.velocity[1] = xy_velocity(1);
-	}
-
-	// ---- 可选的 z 速度前馈 ----
-	// PositionControl 的结构是 P-位置环 + 速度前馈（两者相加，不是二选一）：
-	//   PositionControl::_positionControl():
-	//       vel_sp_position = (_pos_sp - _pos) * gain_P;
-	//       addIfNotNanVector3f(_vel_sp, vel_sp_position);     // NaN 的项不参与
-	// 所以给 velocity[2] 不会和 position[2] 打架。
-	//
-	// 自己下降时**必须**给：land detector 判断"是否被指令下降"读的就是它
-	//   MulticopterLandDetector.cpp:248
-	//       _in_descend = PX4_ISFINITE(tsp.velocity[2]) && (velocity[2] >= 1.1 * LNDMC_Z_VEL_MAX);
-	// 只发 position（velocity = NaN）会让 _in_descend 恒为 false，
-	// ground_contact 永远锁不上 -> landed 永远为 0 -> 后面发的 disarm 被 commander 拒。
-	if (PX4_ISFINITE(z_velocity)) {
-		tsp.velocity[2] = z_velocity;
-	}
-
-	// yaw 每拍都给锁存值（不然可能自己转）；yawspeed 给 NaN = 不控制偏航角速度。
-	tsp.yaw = _yaw_sp;
-	tsp.yawspeed = NAN;
-
-	_traj_sp_pub.publish(tsp);
-}
-
-void MyMission::publishVehicleCommand(uint16_t command, float param1, float param2)
-{
-	vehicle_command_s cmd{};
-	cmd.timestamp = hrt_absolute_time();
-	cmd.command = command;
-	cmd.param1 = param1;
-	cmd.param2 = param2;
-
-	// commander 的校验（Commander.cpp:862）：
-	//   target_system == 自己的 sysid **或 0（广播）** 才处理。
-	// 本模块和 commander 在同一个进程里，用广播 0 最省事，不用去查自己的 sysid。
-	cmd.target_system = 0;
-	cmd.target_component = 0;
-
-	// 填上来源，方便 commander / 日志区分是谁发的
-	cmd.source_system = 1;
-	cmd.source_component = 1;
-
-	// false = 内部命令。commander 有些分支会区分内外来源（比如 arm/disarm 的
-	// arm_disarm_reason），外部来的命令校验更严。
-	cmd.from_external = false;
-	_vehicle_command_pub.publish(cmd);
 }
 
 // ===========================================================================
-// 接管安全：油门杆回中检测
+// 每拍入口：退出协议 -> 取数 -> 安全兜底 -> 分发
 // ===========================================================================
-// 为什么需要它：飞手把模式开关拨出 Offboard 的那一刻，高度通道立刻由油门杆接管。
-// PX4 在 FlightTaskManualAltitude 里的行为是（每拍都跑，没有"等杆回中"的闩锁）：
-//
-//   _scaleSticks():
-//       vel_max_z = (throttle < 0) ? MPC_Z_VEL_MAX_DN : MPC_Z_VEL_MAX_UP;
-//       _velocity_setpoint(2) = vel_max_z * -throttle_expo;      // NED，正 = 下降
-//
-//   _updateAltitudeLock():
-//       apply_brake = fabsf(throttle_expo) <= FLT_EPSILON;
-//       杆在中位 -> _position_setpoint(2) = 当前位置（锁高度）
-//       杆不在中位 -> _position_setpoint(2) = NAN（速度环直接用上面那个速度）
-//
-// 所以"油门在最低"进 Position/Altitude = 立刻以 MPC_Z_VEL_MAX_DN（默认 1.5 m/s）下降。
-// 而手势解锁结束后油门正好就在最低 —— 这个坑是真实存在的。
-//
-// 本模块只做"检测 + 告警"：模式是 commander 切的，模块拦不住，也不该去抢。
-void MyMission::updateExternalParams()
-{
-	// MAN_DEADZONE：判"油门算不算在中位"，和
-	// FlightTaskManualAltitude::_updateAltitudeLock() 的 apply_brake 对齐
-	if (_param_man_deadzone == PARAM_INVALID) {
-		_param_man_deadzone = param_find("MAN_DEADZONE");
-	}
-
-	float deadzone = _man_deadzone;
-
-	if ((_param_man_deadzone != PARAM_INVALID) && (param_get(_param_man_deadzone, &deadzone) == PX4_OK)) {
-		_man_deadzone = deadzone;
-	}
-
-	// LNDMC_Z_VEL_MAX：land detector 认"被指令下降"的门槛
-	//   _in_descend 要求 trajectory_setpoint.velocity[2] >= 1.1 * LNDMC_Z_VEL_MAX
-	// 自己下降时（MYM_LAND_MODE=0）必须发够这个速度，否则 landed 永远上不去。
-	if (_param_lndmc_z_vel_max == PARAM_INVALID) {
-		_param_lndmc_z_vel_max = param_find("LNDMC_Z_VEL_MAX");
-	}
-
-	float lndmc_z_vel_max = _in_descend_min_vel / 1.1f;
-
-	if ((_param_lndmc_z_vel_max != PARAM_INVALID) && (param_get(_param_lndmc_z_vel_max, &lndmc_z_vel_max) == PX4_OK)) {
-		_in_descend_min_vel = 1.1f * lndmc_z_vel_max;
-	}
-
-	// MPC_XY_ERR_MAX / MPC_Z_ERR_MAX / MPC_JERK_AUTO / MPC_XY_VEL_MAX /
-	// MPC_Z_V_AUTO_UP / MPC_ACC_UP_MAX：这几个都是喂给 PositionSmoothing 的限制，
-	// **直接复用 PX4 自己的参数**，不另造 MYM_ 参数。理由：
-	//   1) 语义完全一致 —— GotoControl 就是这么喂的（GotoControl.hpp:99-102）；
-	//   2) PX4 默认值都是调过的，自己再发明一套没有依据；
-	//   3) 和 LNDMC_Z_VEL_MAX 同一个套路：要和 PX4 行为对齐的阈值就抄 PX4 的。
-	// MYM_FWD_SPD / MYM_FWD_ACC 不在这里读 —— 它们是本模块自己的参数，
-	// 在 FORWARD 入口直接取（见 Run()）。
-	struct {
-		const char *name;
-		param_t *handle;
-		float *value;
-	} externals[] = {
-		{"MPC_XY_ERR_MAX",  &_param_mpc_xy_err_max,  &_mpc_xy_err_max},
-		{"MPC_Z_ERR_MAX",   &_param_mpc_z_err_max,   &_mpc_z_err_max},
-		{"MPC_JERK_AUTO",   &_param_mpc_jerk_auto,   &_mpc_jerk_auto},
-		{"MPC_XY_VEL_MAX",  &_param_mpc_xy_vel_max,  &_mpc_xy_vel_max},
-		{"MPC_Z_V_AUTO_UP", &_param_mpc_z_v_auto_up, &_mpc_z_v_auto_up},
-		{"MPC_ACC_UP_MAX",  &_param_mpc_acc_up_max,  &_mpc_acc_up_max},
-	};
-
-	for (auto &ext : externals) {
-		if (*(ext.handle) == PARAM_INVALID) {
-			*(ext.handle) = param_find(ext.name);
-		}
-
-		float value = *(ext.value);
-
-		if ((*(ext.handle) != PARAM_INVALID) && (param_get(*(ext.handle), &value) == PX4_OK)) {
-			*(ext.value) = value;
-		}
-	}
-}
-
-bool MyMission::throttleStickCentered(const manual_control_setpoint_s &manual_control) const
-{
-	// 和 PX4 判"油门在中位"逐字对齐：
-	//   FlightTaskManualAltitude::_updateAltitudeLock()
-	//     apply_brake = fabsf(_sticks.getThrottleZeroCenteredExpo()) <= FLT_EPSILON
-	//   Sticks::getThrottleZeroCenteredExpo() = expo(deadzone(throttle, MAN_DEADZONE), 0.6)
-	//   math::deadzone() 在 |x| <= deadzone 时返回 0，而 expo(0) = 0
-	//   => "在中位" 等价于 |throttle| <= MAN_DEADZONE（默认 0.1，归一化行程）
-	return manual_control.valid && (fabsf(manual_control.throttle) <= _man_deadzone);
-}
-
-void MyMission::checkTakeoverSafety(const vehicle_status_s &status, const manual_control_setpoint_s &manual_control)
-{
-	const int nav = status.nav_state;
-
-	// 高度直接由油门杆决定的模式（杆在中位 = 锁高度，否则 = 升降速度指令）
-	const bool altitude_from_throttle = (nav == vehicle_status_s::NAVIGATION_STATE_POSCTL)
-					    || (nav == vehicle_status_s::NAVIGATION_STATE_POSITION_SLOW)
-					    || (nav == vehicle_status_s::NAVIGATION_STATE_ALTCTL)
-					    || (nav == vehicle_status_s::NAVIGATION_STATE_ALTITUDE_CRUISE);
-
-	// 手动推力模式：更狠 —— 杆在最低就是零推力，直接掉高度
-	const bool manual_thrust = (nav == vehicle_status_s::NAVIGATION_STATE_STAB)
-				   || (nav == vehicle_status_s::NAVIGATION_STATE_MANUAL)
-				   || (nav == vehicle_status_s::NAVIGATION_STATE_ACRO);
-
-	// Hold / Return / Mission 这些不吃摇杆的模式是安全的，不告警
-	if (!altitude_from_throttle && !manual_thrust) {
-		return;
-	}
-
-	if (throttleStickCentered(manual_control)) {
-		return;
-	}
-
-	_takeover_warned = true;
-
-	/* EVENT
-	 * @description
-	 * The vehicle left Offboard mode while the throttle stick was not centered.
-	 * In Position/Altitude the altitude is then commanded by the stick
-	 * (descend at MPC_Z_VEL_MAX_DN), in Stabilized/Manual there is no thrust at all.
-	 * Center the throttle stick first (or switch to Hold) before taking over.
-	 */
-	events::send(events::ID("my_mission_takeover_throttle_off_center"),
-	{events::Log::Critical, events::LogInternal::Info},
-	"Left Offboard with throttle stick off center: altitude will drop immediately");
-
-	PX4_ERR("my_mission: left Offboard with throttle off center (%.2f, |x| > %.2f): altitude will drop now",
-		(double)manual_control.throttle, (double)_man_deadzone);
-}
-
 void MyMission::Run()
 {
 	// 【模块退出协议】外部执行 `my_mission stop` 时 should_exit() 变 true。
@@ -548,13 +301,14 @@ void MyMission::Run()
 			 : math::constrain((now - _last_run) * 1e-6f, 0.002f, 0.04f);
 	_last_run = now;
 
-	// 参数在线更新：QGC 或命令行改完 MYM_* 立即生效，不用重启模块、更不用重编。
+	// 参数在线更新：QGC 或命令行改完 MYM_* / MYR_* 立即生效，不用重启模块、更不用重编。
 	if (_parameter_update_sub.updated()) {
 		updateParams();
-		updateExternalParams();   // MAN_DEADZONE / LNDMC_Z_VEL_MAX 一起刷新
+		refreshConfig();
+		_external.refresh();
 	}
 
-	// ---- 读状态 ----
+	// ---- 取数 ----
 	// copy() = 取最新一份（不判断有没有更新）；update() = 有新数据才覆盖。
 	// 这里只关心"当前是什么状态"，所以 copy 就够；local_position 用 update 是为了
 	// 少一次无谓拷贝（两者对逻辑没有区别）。
@@ -575,382 +329,400 @@ void MyMission::Run()
 	const bool pos_valid = localPositionValid(pos, now);
 	const bool offboard = (status.nav_state == vehicle_status_s::NAVIGATION_STATE_OFFBOARD);
 
-	// publishTrajectorySetpoint() 用它来决定"这一拍该不该发 setpoint"，
-	// 不能乱发的原因见那个函数开头（会和 land detector 抢同一条 topic）。
-	_in_offboard = offboard;
+	// MissionOutput 用它决定"这一拍该不该发 setpoint"，
+	// 不能乱发的原因见 MissionOutput::publishSetpoint 开头。
+	_output.setOffboard(offboard);
 
 	// ---- 1) 先发 offboard_control_mode ----
 	// 放在状态机之前、而且**任何状态都发**，三个原因：
 	//   a) 切进 Offboard 之前就得让 commander 看到信号，否则模式开关切不进去；
 	//   b) 进去之后不能断，断了就是 offboard loss failsafe；
 	//   c) WAIT / DONE 也可能正处在 Offboard 里（比如刚上锁还没切走），一样要续命。
-	publishOffboardControlMode(now);
+	publishControlMode(now);
 
 	// ---- 2) 安全兜底 ----
-	// 只有"正在起飞 / 前飞 / 悬停"时，掉出 Offboard 或上锁才算异常，直接中止。
-	// LAND 阶段允许离开 Offboard —— 方式 1 的 AUTO_LAND 本来就会把 nav_state 切走；
-	// DISARM / DONE 本来就已经落地或结束，不算异常。
-	if ((_state == State::Takeoff || _state == State::Forward || _state == State::Hover)
+	// 只有"正在起飞 / 前飞 / 绳段 / 低头 / 悬停"时，掉出 Offboard 或上锁才算异常，
+	// 直接中止。LAND 阶段允许离开 Offboard —— 方式 1 的 AUTO_LAND 本来就会把
+	// nav_state 切走；DISARM / DONE 本来就已经落地或结束，不算异常。
+	if ((_state == State::Takeoff || _state == State::Forward
+	     || _state == State::Tilt || _state == State::Hover)
 	    && (!offboard || !armed.armed)) {
 		PX4_WARN("my_mission: abort (offboard=%d armed=%d)", (int)offboard, (int)armed.armed);
-		_state = State::Done;
-		_state_start = now;   // Done 的计时从这里开始（2b 的接管检查用它开 1 秒窗口）
+		enterState(State::Done, now);
 	}
 
-	// ---- 2b) 接管安全：离开 Offboard 后油门没回中 ----
+	// ---- 3) 接管安全：离开 Offboard 后油门没回中 ----
 	// 放在 Done 的头 1 秒内检查，而不是上面那个 if 里：nav_state 的更新比
 	// mode 开关晚 1~2 拍，在 Done 里再看几拍容错更大。
 	// armed 才检查 —— 如果是被 kill/termination 上锁退出的，不会再有掉高度的问题。
 	if (!_takeover_warned && (_state == State::Done) && armed.armed && (elapsedSince(_state_start, now) < 1.f)) {
-		checkTakeoverSafety(status, manual_control);
+		_takeover_warned = _takeover.evaluate(status, manual_control, _external.manDeadzone());
 	}
 
-	switch (_state) {
+	// ---- 4) 分发 ----
+	const Tick tick{now, dt, pos, att, armed, land, pos_valid, offboard};
 
-	case State::Wait:
-		// 进 Offboard 之前：目标 = 当前位置。位置环就算已经在跑也不会动。
-		holdCurrentPosition(pos, att, pos_valid);
-		publishTrajectorySetpoint(now);
+	static constexpr Handler kHandlers[] = {
+		&MyMission::stateWait, &MyMission::stateTakeoff, &MyMission::stateForward,
+		&MyMission::stateTilt, &MyMission::stateHover,
+		&MyMission::stateLand, &MyMission::stateDisarm, &MyMission::stateDone,
+	};
+	static_assert(sizeof(kHandlers) / sizeof(kHandlers[0]) == int(State::Count), "state table out of sync");
 
-		// 三个条件齐了才起飞：
-		//   armed     —— 电机允许转
-		//   offboard  —— 飞手已经切到 Offboard（本模块不主动切）
-		//   pos_valid —— position 型 Offboard 的前提（EKF 位置可用）
-		if (armed.armed && offboard && pos_valid) {
-			// 记录"地面参考"：NED 里 z 向下，所以地面就是进入 Offboard 时的 z。
-			// 目标高度 = 地面 z - MYM_ALT（减去一个正数 = 往上）。
-			_ground_z = pos.z;
-			_target(2) = _ground_z - _param_mym_alt.get();
+	(this->*kHandlers[int(_state)])(tick);
+}
 
-			// 锁死这一刻的航向。_yaw_sp 是 holdCurrentPosition() 每拍从姿态里抄的，
-			// 出了 WAIT 就没人再刷新它（只有 WAIT/DONE 调 holdCurrentPosition），
-			// 所以它天然就是"起飞时的机头方向"，后面 Forward 直接拿来用。
-			// 记一份到 _takeoff_yaw 只是为了让 TAKEOFF 分支读起来不用去猜 _yaw_sp 的生命周期。
-			_takeoff_yaw = _yaw_sp;
+// ===========================================================================
+// 状态函数
+// ===========================================================================
+void MyMission::stateWait(const Tick &tick)
+{
+	// 进 Offboard 之前：目标 = 当前位置。位置环就算已经在跑也不会动。
+	holdCurrentPosition(tick.pos, tick.att, tick.pos_valid);
+	publishSetpoint(targetSetpoint(), tick.now);
 
-			_state = State::Takeoff;
-			_state_start = now;
-			PX4_INFO("my_mission: TAKEOFF -> %.2f m (yaw %.0f deg)", (double)_param_mym_alt.get(),
-				 (double)math::degrees(_takeoff_yaw));
-		}
+	// 三个条件齐了才起飞：
+	//   armed     —— 电机允许转
+	//   offboard  —— 飞手已经切到 Offboard（本模块不主动切）
+	//   pos_valid —— position 型 Offboard 的前提（EKF 位置可用）
+	if (tick.armed.armed && tick.offboard && tick.pos_valid) {
+		// 记录"地面参考"：NED 里 z 向下，所以地面就是进入 Offboard 时的 z。
+		// 目标高度 = 地面 z - MYM_ALT（减去一个正数 = 往上）。
+		_ground_z = tick.pos.z;
+		_target(2) = _ground_z - _config.alt;
 
-		break;
+		// 系绳测试的锚点/绷紧点都以**起飞点**为基准，钉死这一刻的三维位置。
+		// 用 pos（EKF 当前位置）而不是 _target：两者此刻本来就相等
+		// （holdCurrentPosition 每拍把 _target 钉在当前位置），但 pos 是实测值。
+		_takeoff_pos = matrix::Vector3f(tick.pos.x, tick.pos.y, tick.pos.z);
 
-	case State::Takeoff:
-		// 每拍都发同一个目标位置。位置环会把它自己的速度/加速度限制加进来，
-		// 所以"一次阶跃 1 m"不会真的瞬移，而是受控爬升。
-		publishTrajectorySetpoint(now);
+		// 锁死这一刻的航向。_yaw_sp 是 holdCurrentPosition() 每拍从姿态里抄的，
+		// 出了 WAIT 就没人再刷新它（只有 WAIT/DONE 调 holdCurrentPosition），
+		// 所以它天然就是"起飞时的机头方向"，后面 Forward/Rope 直接拿来用。
+		_takeoff_yaw = _yaw_sp;
 
-		if (reachedTarget(pos)) {
-			const float fwd_dist = _param_mym_fwd_dist.get();
-
-			if (fwd_dist > 0.f) {
-				// ===========================================================
-				// 算"前方那一个点"
-				// ===========================================================
-				// 航向 psi 的**机头单位向量在 NED 里就是 (cos psi, sin psi)**。
-				// 原因：psi 的定义是"从北起、顺时针为正"，而 NED 的 x 指北、y 指东，
-				// 所以 x->y 正好也是顺时针 —— 两个角度系统重合，不用转负号。
-				// （对比 FRD 的 body x 轴，那个才要 (cos psi, sin psi, ...) 配合 z 向下。）
-				const float psi = _takeoff_yaw + math::radians(_param_mym_fwd_dir.get());
-
-				// 起点用 _target(0)/(1)：TAKEOFF 全程没动过它们，还是 WAIT 里钉下的
-				// 起飞点。这样"飞到哪个点"相对起飞点固定，同一个场地跑几次都落在同一处。
-				//
-				// 【关键】这里只把**终点**存进 _fwd_goal，**_target 一个数都不改**。
-				// 以前是直接 _target += fwd_dist*dir，那是给位置环一个阶跃，
-				// 位置环下一拍就会要 (阶跃 x MPC_XY_P) 那么大的速度、姿态猛压。
-				// 现在 _target 留在起飞点，由 FORWARD 状态每拍推一点点过去。
-				_fwd_goal(0) = _target(0) + fwd_dist * cosf(psi);
-				_fwd_goal(1) = _target(1) + fwd_dist * sinf(psi);
-
-				// z 不动：先在 MYM_ALT 上平飞过去，到了再降。
-				// 三维终点给平滑器；xy 那两维给本模块自己留着（print_status 和日志用）。
-				_fwd_goal3 = matrix::Vector3f(_fwd_goal(0), _fwd_goal(1), _target(2));
-
-				// ===========================================================
-				// 交给 PositionSmoothing（和 GotoControl 用的是同一套）
-				// ===========================================================
-				// 先设限制。**每次进 FORWARD 都设一遍**：代价只是几个赋值，
-				// 换来的是运行中改 MYM_* / MPC_* 立刻生效，不用重启模块。
-				//
-				// 速度/加速度用本模块的 MYM_，其余用 PX4 的 —— 口径和
-				// GotoControl.hpp:99-102 一致。注意 setCruiseSpeed 是**速度规划的
-				// 上限**（_getMaxXYSpeed 里的 config.max_speed_xy），忘设的症状是
-				// "速度永远上不去"，而加速度和 jerk 看起来都正常，很容易误判。
-				const float spd = math::max(_param_mym_fwd_spd.get(), 0.01f);
-				const float acc = math::max(_param_mym_fwd_acc.get(), 0.05f);
-
-				_pos_smoothing.setCruiseSpeed(spd);
-				_pos_smoothing.setMaxAccelerationXY(acc);
-				_pos_smoothing.setMaxVelocityXY(math::max(_mpc_xy_vel_max, spd));
-				_pos_smoothing.setMaxJerk(math::max(_mpc_jerk_auto, 0.1f));
-				_pos_smoothing.setMaxAllowedHorizontalError(math::max(_mpc_xy_err_max, 0.f));
-				_pos_smoothing.setMaxAllowedVerticalError(math::max(_mpc_z_err_max, 0.f));
-				_pos_smoothing.setMaxVelocityZ(math::max(_mpc_z_v_auto_up, 0.1f));
-				_pos_smoothing.setMaxAccelerationZ(math::max(_mpc_acc_up_max, 0.1f));
-
-				// 用飞机**当前的三阶状态**点亮平滑器：位置、速度、加速度。
-				// 给加速度是关键 —— 轨迹的加速度从飞机此刻的加速度出发，
-				// 任何一个阶次上都不出现跳变。GotoControl.cpp:71-75 是同样的做法。
-				_pos_smoothing.reset(matrix::Vector3f(pos.ax, pos.ay, pos.az),
-						     matrix::Vector3f(pos.vx, pos.vy, pos.vz),
-						     matrix::Vector3f(pos.x, pos.y, pos.z));
-
-				_state = State::Forward;
-				_state_start = now;
-
-				// 按 MYM_FWD_SPD / MYM_FWD_ACC 估算"理想梯形曲线"要走多久，和
-				// MYM_FWD_TMO 对一下。真实轨迹因为 jerk 受限会更慢一点，
-				// 所以这是个乐观下界 —— 拿它当提醒够用。
-				const float d_ramp = spd * spd / acc;   // 加速段 + 减速段一共走的距离
-				const float t_est = (fwd_dist > d_ramp)
-						    ? (2.f * spd / acc + (fwd_dist - d_ramp) / spd)
-						    : (2.f * sqrtf(fwd_dist / acc));
-
-				PX4_INFO("my_mission: FORWARD %.2f m at %.0f deg (heading %.0f deg) -> target [%.2f %.2f]",
-					 (double)fwd_dist, (double)_param_mym_fwd_dir.get(),
-					 (double)math::degrees(_takeoff_yaw), (double)_fwd_goal(0), (double)_fwd_goal(1));
-				PX4_INFO("my_mission: smoother cruise %.2f m/s acc %.2f m/s^2 jerk %.2f, est %.1f s (tilt ~%.0f deg)",
-					 (double)spd, (double)acc, (double)_mpc_jerk_auto, (double)t_est,
-					 (double)math::degrees(atanf(acc / CONSTANTS_ONE_G)));
-
-				if (t_est > _param_mym_fwd_tmo.get()) {
-					PX4_WARN("my_mission: est %.1f s > MYM_FWD_TMO %.1f s -> will time out; "
-						 "raise MYM_FWD_TMO or MYM_FWD_SPD", (double)t_est, (double)_param_mym_fwd_tmo.get());
-				}
-
-			} else {
-				// MYM_FWD_DIST = 0：跳过 FORWARD，行为跟没有这个功能时完全一样。
-				_state = State::Hover;
-				_state_start = now;
-				PX4_INFO("my_mission: HOVER %.1f s", (double)_param_mym_hover.get());
-			}
-
-		} else if (elapsedSince(_state_start, now) > _param_mym_tko_tmo.get()) {
-			// 爬不上去（推力不够 / 位置估计漂 / MYM_ARRIVE 设太小）→ 安全起见直接转降落，
-			// 不要无限期悬在那里等。
-			PX4_WARN("my_mission: takeoff timeout, going to LAND");
-			_state = State::Land;
-			_state_start = now;
-			_land_cmd_sent = false;
-		}
-
-		break;
-
-	case State::Forward: {
-			// ===========================================================
-			// 让 PX4 自己的轨迹生成器算这一拍该发什么
-			// ===========================================================
-			// 输入：飞机的**真实位置**（不是上一次的 setpoint）+ 三维终点。
-			// 外部前馈速度给 0 —— 本模块没有别的参考源，参考完全由平滑器生成。
-			// force_zero_velocity_setpoint = false：正常生成轨迹，不是"要求立刻停住"。
-			//
-			// 平滑器每拍做三件事（PositionSmoothing.cpp:285-350）：
-			//   1) 把"位置目标"换算成"速度目标"（速度上限由剩余距离反解，见 TrajMath.hpp）
-			//   2) 用上一拍解出的三段时长，从**上一拍记录的状态**推进 dt
-			//   3) 以推进后的状态为新起点，重解一次三段时长
-			// 第 2 步从记录状态求值而不是增量累加，是它不漂的原因。
-			PositionSmoothing::PositionSmoothingSetpoints sp;
-			_pos_smoothing.generateSetpoints(matrix::Vector3f(pos.x, pos.y, pos.z),
-							 _fwd_goal3,
-							 matrix::Vector3f(),
-							 dt, false, sp);
-
-			// 位置、速度、**加速度**三个量一起发 —— 加速度这一项就是修掉末端过冲的关键：
-			// PositionControl.cpp:153 把它直接加进加速度指令，绕过了速度环那个
-			// τ ≈ 0.56 s 的一阶滞后。没有它，参考做匀速减速时飞机永远比参考快 a·τ，
-			// 到终点时早就冲过去了（实测 0.39~0.45 m）。
-			publishTrajectorySetpoint(now, NAN, matrix::Vector2f(sp.velocity(0), sp.velocity(1)),
-						  sp.position, sp.acceleration);
-
-			// 让 HOVER / LAND / print_status 接着用同一个位置
-			_target = sp.position;
-
-			// ===========================================================
-			// 到位判据
-			// ===========================================================
-			// 两件事都满足才算到：
-			//   1) **轨迹**已经贴住终点。平滑器的速度上限是按剩余距离反解的，
-			//      所以"位置到终点"和"速度归零"本来就是同一件事（TrajMath.hpp:61-71）。
-			//   2) **飞机**的速度也小。轨迹到了不等于飞机到了，中间还有跟踪误差。
-			// 位置口径用 MYM_ARRIVE（默认 0.20 m），比 PX4 任务航点的 NAV_ACC_RAD
-			// （10 m）严格得多 —— 我们要的是"停在这个点上"，不是"进圈算过"。
-			const float dist_to_goal = (_fwd_goal3 - sp.position).norm();
-			const matrix::Vector3f v(pos.vx, pos.vy, pos.vz);
-
-			if ((dist_to_goal < _param_mym_arrive.get()) && (v.norm() < 0.3f)) {
-				// ⚠ 进 HOVER 之前把 _target **钉到真正的终点**，不要留在平滑器
-				// 最后的位置上。到位判据带 MYM_ARRIVE 的容差（默认 0.2 m），
-				// 而平滑器是渐近收敛的 —— 直接切走会让飞机永久停在离终点
-				// 最多 0.2 m 的地方（实测 0.14 m）。钉到终点之后，HOVER 的
-				// 位置环会把剩下那点走完。
-				_target = _fwd_goal3;
-
-				_state = State::Hover;
-				_state_start = now;
-				PX4_INFO("my_mission: reached forward point [%.2f %.2f], HOVER %.1f s",
-					 (double)sp.position(0), (double)sp.position(1), (double)_param_mym_hover.get());
-
-			} else if (elapsedSince(_state_start, now) > _param_mym_fwd_tmo.get()) {
-				// 飞不到（航向估计歪 / 顶风 / EKF 位置漂 / 限幅设得太小）→ 不再硬追，
-				// 和起飞超时同样的策略：直接进降落流程，别一直在外面飞。
-				PX4_WARN("my_mission: forward timeout (traj %.2f m from goal, v %.2f m/s), going to LAND",
-					 (double)dist_to_goal, (double)v.norm());
-				_state = State::Land;
-				_state_start = now;
-				_land_cmd_sent = false;
-			}
-
-			break;
-		}
-
-	case State::Hover:
-		// 目标不变（起飞点上空，或者有 MYM_FWD_DIST 时是前方那个点），位置环自己维持。
-		// 注意这里**必须继续发** setpoint：不发就是 offboard signal lost，飞机会按 COM_OBL_RC_ACT 切走。
-		publishTrajectorySetpoint(now);
-
-		if (elapsedSince(_state_start, now) >= _param_mym_hover.get()) {
-			_state = State::Land;
-			_state_start = now;
-			_land_cmd_sent = false;   // 允许在 LAND 里发一次降落命令
-			PX4_INFO("my_mission: LAND (mode %d)", (int)_param_mym_land_mode.get());
-		}
-
-		break;
-
-	case State::Land:
-		if (_param_mym_land_mode.get() == 1) {
-			// ---- 方式 1：交给 PX4 的 AUTO_LAND ----
-			// 发一次 MAV_CMD_NAV_LAND，commander 会强制切到 NAVIGATION_STATE_AUTO_LAND
-			// （Commander.cpp:1236-1247，注意那里 force = true，所以随时可切）。
-			// 之后的收油门 / flare / 着陆检测 / 按 COM_DISARM_LAND 自动上锁
-			// 全部由 PX4 负责，比自己在 Offboard 里硬降稳得多。
-			//
-			// 只发一次：这是"切模式"命令，不是连续控制量，每拍重发没有意义。
-			if (!_land_cmd_sent) {
-				publishVehicleCommand(vehicle_command_s::VEHICLE_CMD_NAV_LAND);
-				_land_cmd_sent = true;
-			}
-
-			// 这里**不再发 trajectory_setpoint**：nav_state 已经不是 Offboard，
-			// 发了也没人看，留着只会让人误以为还在自己控。
-			if (!armed.armed) {
-				// PX4 自己上锁了（COM_DISARM_LAND，默认 2 s），省掉我们的 DISARM 步骤
-				_state = State::Done;
-				PX4_INFO("my_mission: landed + disarmed");
-
-			} else if (land.landed && _param_mym_auto_disarm.get() != 0) {
-				// 已经判到着地，主动补一发 disarm（不等 PX4 那个 2 s）
-				_state = State::Disarm;
-				_state_start = now;
-				_last_disarm_cmd = 0;
-
-			} else if (elapsedSince(_state_start, now) > _param_mym_land_tmo.get()) {
-				// 降不下去 / 着地检测一直不触发：退一步，直接尝试上锁并结束
-				PX4_WARN("my_mission: land timeout, trying to disarm");
-				_state = State::Disarm;
-				_state_start = now;
-				_last_disarm_cmd = 0;
-			}
-
-		} else {
-			// ---- 方式 0：纯 Offboard 下降 ----
-			// 自己把目标 z 以 MYM_DESC_RATE 一帧一帧地往"地面参考"抬。
-			// NED 里下降 = z 变大，所以是 + rate*dt，上限是 _ground_z。
-			// 用斜坡而不是直接跳到地面：位置环虽然也有速度限幅，但自己限速更可控，
-			// status 里看到的 setpoint 也是平滑的。
-			//
-			// 同时把 rate 当作 velocity[2] 前馈一起发出去 —— 这是让 land detector
-			// 能判"被指令下降"的唯一方式（MulticopterLandDetector.cpp:248），
-			// 没有它 landed 永远是 0，后面的 disarm 一定被 commander 拒。
-			// 下限是 1.1 * LNDMC_Z_VEL_MAX（默认 0.25 -> 0.275 m/s）：
-			// 低于它 _in_descend 就恒为 false，所以这里把参数抬上去并告警一次。
-			float desc_rate = _param_mym_desc_rate.get();
-
-			if (desc_rate < _in_descend_min_vel) {
-				if (!_desc_rate_warned) {
-					_desc_rate_warned = true;
-					PX4_WARN("my_mission: MYM_DESC_RATE %.2f < %.2f (1.1*LNDMC_Z_VEL_MAX): raised, otherwise landing is undetectable",
-						 (double)desc_rate, (double)_in_descend_min_vel);
-				}
-
-				desc_rate = _in_descend_min_vel;
-			}
-
-			if (pos_valid) {
-				_target(2) = math::min(_target(2) + desc_rate * dt, _ground_z);
-			}
-
-			publishTrajectorySetpoint(now, desc_rate);
-
-			if (!armed.armed) {
-				_state = State::Done;
-
-			} else if (land.landed || land.maybe_landed) {
-				// **以 land detector 为准**收尾。
-				// 不能用"目标 z 到了 + vz 小了"这种宽松判据：那只是"物理上贴地了"，
-				// commander 的 disarm 检查要的是 land detector 的 landed/maybe_landed。
-				// 我们一直在发 velocity[2] 前馈，所以 detector 会在触地后约 1 秒内
-				// 依次满足 has_low_throttle -> ground_contact -> maybe_landed -> landed。
-				// 兜底是 MYM_LAND_TMO（默认 40 s），超时会走上面那条超时分支。
-				if (_param_mym_auto_disarm.get() != 0) {
-					_state = State::Disarm;
-					_state_start = now;
-					_last_disarm_cmd = 0;
-					PX4_INFO("my_mission: land detector confirmed (%s), disarming",
-						 land.landed ? "landed" : "maybe_landed");
-
-				} else {
-					_state = State::Done;
-				}
-			}
-		}
-
-		break;
-
-	case State::Disarm:
-
-		// MAV_CMD_COMPONENT_ARM_DISARM 的 param1：1 = arm，0 = disarm。
-		// 这里 param1 = 0。param2 保持 0 = 普通上锁：PX4 会拒绝"空中上锁"，
-		// 只有 param2 = 21196（force）才允许在空中强行断动力 —— 那是紧急手段，
-		// 这里不用。
-		if (!armed.armed) {
-			_state = State::Done;
-			PX4_INFO("my_mission: DISARMED");
-
-		} else {
-			// 1 Hz 重试：commander 可能因为"还没判到着地"拒绝一次，过一会再试。
-			if (_last_disarm_cmd == 0 || elapsedSince(_last_disarm_cmd, now) > 1.f) {
-				publishVehicleCommand(vehicle_command_s::VEHICLE_CMD_COMPONENT_ARM_DISARM, 0.f, 0.f);
-				_last_disarm_cmd = now;
-			}
-
-			if (elapsedSince(_state_start, now) > _param_mym_disarm_tmo.get()) {
-				PX4_WARN("my_mission: disarm timeout, giving up");
-				_state = State::Done;
-			}
-		}
-
-		break;
-
-	case State::Done:
-		// 任务结束。仍然把 setpoint 钉在当前位置：如果飞手这时又切进 Offboard，
-		// 位置环的目标就是当前位置，不会飞回旧的悬停点。
-		holdCurrentPosition(pos, att, pos_valid);
-		publishTrajectorySetpoint(now);
-
-		// 已上锁 → 回到 WAIT：下一次 arm + 切 Offboard 会自动重跑整个流程。
-		if (!armed.armed) {
-			_state = State::Wait;
-			_takeover_warned = false;   // 允许下一轮再告警
-			_state_start = now;
-		}
-
-		break;
+		enterState(State::Takeoff, tick.now);
+		PX4_INFO("my_mission: TAKEOFF -> %.2f m (yaw %.0f deg)", (double)_config.alt,
+			 (double)math::degrees(_takeoff_yaw));
 	}
 }
 
+void MyMission::stateTakeoff(const Tick &tick)
+{
+	// 每拍都发同一个目标位置。位置环会把它自己的速度/加速度限制加进来，
+	// 所以"一次阶跃 1 m"不会真的瞬移，而是受控爬升。
+	publishSetpoint(targetSetpoint(), tick.now);
+
+	if (reachedTarget(tick.pos)) {
+		// ===============================================================
+		// 目的地只有一个，二选一，**在 TAKEOFF 到位这一刻定死**
+		// ===============================================================
+		// 开了绳  -> 绷紧点（斜距正好 = MYR_ROPE_LEN 的那个位置）
+		// 没开绳  -> 前方点（MYM_FWD_DIST / MYM_FWD_DIR）
+		// 两个都配了也是二选一：**绳优先**，MYM_FWD_DIST / MYM_FWD_DIR 失效。
+		//
+		// 结果连同"飞的是哪种"一起闩锁进 _rope_leg：到达时的动作必须和
+		// "出发时选的目的地"一致，不能等到落地前再去看参数 —— 否则飞到一半
+		// 把 MYR_ROPE_LEN 改成 0，飞机会在前飞点上开始低头。
+		_rope_leg = _config.ropeEnabled();
+
+		if (_rope_leg) {
+			solveRope();
+			_goal3 = _rope_solution.taut;
+
+		} else if (_config.fwd_dist > 0.f) {
+			// ===========================================================
+			// 算"前方那一个点"
+			// ===========================================================
+			// 航向 psi 的**机头单位向量在 NED 里就是 (cos psi, sin psi)**。
+			// 原因：psi 的定义是"从北起、顺时针为正"，而 NED 的 x 指北、y 指东，
+			// 所以 x->y 正好也是顺时针 —— 两个角度系统重合，不用转负号。
+			// （对比 FRD 的 body x 轴，那个才要 (cos psi, sin psi, ...) 配合 z 向下。）
+			const float psi = _takeoff_yaw + math::radians(_config.fwd_dir_deg);
+
+			// 起点用 _target(0)/(1)：TAKEOFF 全程没动过它们，还是 WAIT 里钉下的
+			// 起飞点。这样"飞到哪个点"相对起飞点固定，同一个场地跑几次都落在同一处。
+			//
+			// 【关键】这里只把**终点**存进 _goal3，**_target 一个数都不改**。
+			// 以前是直接 _target += fwd_dist*dir，那是给位置环一个阶跃，
+			// 位置环下一拍就会要 (阶跃 x MPC_XY_P) 那么大的速度、姿态猛压。
+			// 现在 _target 留在起飞点，由 FORWARD 状态每拍推一点点过去。
+			_goal3(0) = _target(0) + _config.fwd_dist * cosf(psi);
+			_goal3(1) = _target(1) + _config.fwd_dist * sinf(psi);
+			_goal3(2) = _target(2);   // z 不动：先在 MYM_ALT 上平飞过去
+		}
+
+		if (_rope_leg || (_config.fwd_dist > 0.f)) {
+			enterTransit(tick, State::Forward);
+			logTransitStart(tick);
+
+		} else {
+			// 既没开绳、MYM_FWD_DIST 也是 0：没有目的地，悬停 MYM_HOVER 秒后降落。
+			enterState(State::Hover, tick.now);
+			PX4_INFO("my_mission: HOVER %.1f s", (double)_config.hover);
+		}
+
+	} else if (elapsedSince(_state_start, tick.now) > _config.tko_tmo) {
+		// 爬不上去（推力不够 / 位置估计漂 / MYM_ARRIVE 设太小）→ 安全起见直接转降落，
+		// 不要无限期悬在那里等。
+		PX4_WARN("my_mission: takeoff timeout, going to LAND");
+		enterState(State::Land, tick.now);
+		_land_cmd_sent = false;
+	}
+}
+
+void MyMission::stateForward(const Tick &tick)
+{
+	// 每拍的轨迹生成 + 发布 + 到位判据都在 advanceTransit() 里。
+	if (advanceTransit(tick)) {
+		// ⚠ 切走之前把 _target **钉到真正的终点**，不要留在平滑器最后的位置上。
+		// 到位判据带 MYM_ARRIVE 的容差（默认 0.2 m），而平滑器是渐近收敛的 ——
+		// 直接切走会让飞机永久停在离终点最多 0.2 m 的地方（实测 0.14 m）。
+		// 钉到终点之后，下一个状态的位置环会把剩下那点走完。
+		_target = _goal3;
+
+		if (_rope_leg) {
+			// 到的是绷紧点：绳已经绷直，接着低头（MYR_PITCH_DOWN = 0 时等于原地悬停，
+			// a_ff 为 0，TILT 照常保持 MYM_HOVER 秒再降落）。
+			enterState(State::Tilt, tick.now);
+			_last_rope_log = 0;
+			PX4_INFO("my_mission: taut point reached [%.2f %.2f %.2f] (slant %.2f m), TILT %.1f deg down",
+				 (double)_goal3(0), (double)_goal3(1), (double)_goal3(2),
+				 (double)RopeGeometry::slant(_rope_solution.anchor, _goal3),
+				 (double)_config.pitch_down_deg);
+
+		} else {
+			// 到的是前方点：和以前一样悬停 MYM_HOVER 秒再降落。
+			enterState(State::Hover, tick.now);
+			PX4_INFO("my_mission: reached forward point [%.2f %.2f], HOVER %.1f s",
+				 (double)_goal3(0), (double)_goal3(1), (double)_config.hover);
+		}
+
+	} else if (elapsedSince(_state_start, tick.now) > _config.fwd_tmo) {
+		// 飞不到（航向估计歪 / 顶风 / EKF 位置漂 / 限幅设得太小）→ 不再硬追，
+		// 和起飞超时同样的策略：直接进降落流程，别一直在外面飞。
+		PX4_WARN("my_mission: forward timeout (traj %.2f m from goal), going to LAND", (double)_goal_distance);
+		enterState(State::Land, tick.now);
+		_land_cmd_sent = false;
+	}
+}
+
+void MyMission::stateTilt(const Tick &tick)
+{
+	// ===========================================================
+	// 停住不动，低头 MYR_PITCH_DOWN，高度不变
+	// ===========================================================
+	// 本模块发的是 position 型 offboard，**姿态是位置环的输出**，没法直接指定。
+	// 但加速度前馈会被原样加进加速度指令（PositionControl.cpp:153），
+	// 而加速度到姿态的映射是（_accelerationControl，:222）
+	//     body_z = -(a_x, a_y, g - a_z) 归一化
+	// 也就是 平飞倾角 = atan(a / g)。所以要"低头 φ"，给 a = g*tan(φ) 就行。
+	//
+	// 为什么这样能**停住不动**：低头之后升力的水平分量把飞机往前推，但绳已经
+	// 绷紧、拉住了，飞机几乎不前进 -> 位置误差≈0 -> 位置环和速度环不额外出力
+	// -> 稳态姿态就是 φ。高度由 z 通道自己维持：倾角让升力的竖直分量变成
+	// cos(φ) 倍，位置环会自动补总距；绳的竖直分量（T*sinθ，向下）也在这里
+	// 被一并吸收，所以"高度不变"是自动成立的，不需要额外算。
+	//
+	// 稳态受力（拿来对表用的）：
+	//     4*T_lift*cos(φ) = m*g + T_rope*sin(θ)
+	//     T_rope*cos(θ)   = m*g*tan(φ) + 推力电机的推力
+	// φ = 20° 时 T_rope ≈ 14.6 N（不含推力电机），φ = 30° 时 ≈ 23.1 N。
+	// 插件的张力上限现在是 1000 N（按真绳承载给），这个量级连边都摸不到，
+	// 所以实际约束不是上限而是 <stiffness>（3000 N/m：1 N 对应 0.33 mm 伸长）。
+	// 这一段不含推力电机：位置误差≈0，前推力辅助没有"缺额"可用，
+	// 所以两个推进电机在这个状态下是停着的。
+	//
+	// 实测会差 1~2 度（MYR_PITCH_DOWN=15 得到 13.5）：速度环积分器在 FORWARD 段（飞绷紧点那一趟）
+	// 末端的扰动里留下一点残余（约 -0.27 m/s²），把总加速度从 2.63 拉到 2.35。
+	float pitch_down = math::constrain(_config.pitch_down_deg, -_external.mpcTiltmaxAir(), _external.mpcTiltmaxAir());
+
+	if ((fabsf(pitch_down - _config.pitch_down_deg) > 0.01f) && !_pitch_clamped_warned) {
+		_pitch_clamped_warned = true;
+		PX4_WARN("my_mission: MYR_PITCH_DOWN %.1f deg beyond MPC_TILTMAX_AIR %.1f deg: clamped",
+			 (double)_config.pitch_down_deg, (double)_external.mpcTiltmaxAir());
+	}
+
+	const float a_ff = CONSTANTS_ONE_G * tanf(math::radians(pitch_down));
+
+	// 沿起飞航向的加速度前馈；z 给 NaN = 不做前馈，让位置环自己维持高度。
+	MissionOutput::Setpoint setpoint = targetSetpoint();
+	setpoint.acceleration = matrix::Vector3f(a_ff * cosf(_takeoff_yaw), a_ff * sinf(_takeoff_yaw), NAN);
+	publishSetpoint(setpoint, tick.now);
+
+	// 1 Hz 打一次实测的斜距 / 绳角 / 俯仰，和 gz 那边的张力遥测对表：
+	//   gz topic -e -t /towed_0/tether     （x = 张力[N]，y = 斜距[m]，z = 绳角[deg]）
+	if ((_last_rope_log == 0) || (elapsedSince(_last_rope_log, tick.now) >= 1.f)) {
+		_last_rope_log = tick.now;
+
+		const matrix::Vector3f here(tick.pos.x, tick.pos.y, tick.pos.z);
+
+		// 实际俯仰角。Eulerf 的 theta 正 = 抬头，所以"低头角"要取负。
+		const float pitch_real = -math::degrees(matrix::Eulerf(matrix::Quatf(tick.att.q)).theta());
+
+		PX4_INFO("my_mission: TILT demand %.1f deg, actual %.1f deg, slant %.2f m, rope angle %.1f deg",
+			 (double)pitch_down, (double)pitch_real,
+			 (double)RopeGeometry::slant(_rope_solution.anchor, here),
+			 (double)RopeGeometry::angleDeg(_rope_solution.anchor, here));
+	}
+
+	// 保持时间用 MYR_TILT_HOLD，**不是 MYM_HOVER** —— 低头保持多久和
+	// "没开绳时到前方点悬停多久"是两件独立的事，共用一个参数会互相牵制。
+	if (elapsedSince(_state_start, tick.now) >= _config.tilt_hold) {
+		enterState(State::Land, tick.now);
+		_land_cmd_sent = false;
+		PX4_INFO("my_mission: TILT done (%.1f s), LAND (mode %d)", (double)_config.tilt_hold, _config.land_mode);
+	}
+}
+
+void MyMission::stateHover(const Tick &tick)
+{
+	// 目标不变（起飞点上空，或者有 MYM_FWD_DIST 时是前方那个点），位置环自己维持。
+	// 注意这里**必须继续发** setpoint：不发就是 offboard signal lost，
+	// 飞机会按 COM_OBL_RC_ACT 切走。
+	publishSetpoint(targetSetpoint(), tick.now);
+
+	if (elapsedSince(_state_start, tick.now) >= _config.hover) {
+		enterState(State::Land, tick.now);
+		_land_cmd_sent = false;   // 允许在 LAND 里发一次降落命令
+		PX4_INFO("my_mission: LAND (mode %d)", _config.land_mode);
+	}
+}
+
+void MyMission::stateLand(const Tick &tick)
+{
+	if (_config.land_mode == 1) {
+		// ---- 方式 1：交给 PX4 的 AUTO_LAND ----
+		// 发一次 MAV_CMD_NAV_LAND，commander 会强制切到 NAVIGATION_STATE_AUTO_LAND
+		// （Commander.cpp:1236-1247，注意那里 force = true，所以随时可切）。
+		// 之后的收油门 / flare / 着陆检测 / 按 COM_DISARM_LAND 自动上锁
+		// 全部由 PX4 负责，比自己在 Offboard 里硬降稳得多。
+		//
+		// 只发一次：这是"切模式"命令，不是连续控制量，每拍重发没有意义。
+		if (!_land_cmd_sent) {
+			_output.publishCommand(vehicle_command_s::VEHICLE_CMD_NAV_LAND);
+			_land_cmd_sent = true;
+		}
+
+		// 这里**不再发 trajectory_setpoint**：nav_state 已经不是 Offboard，
+		// 发了也没人看，留着只会让人误以为还在自己控。
+		if (!tick.armed.armed) {
+			// PX4 自己上锁了（COM_DISARM_LAND，默认 2 s），省掉我们的 DISARM 步骤
+			_state = State::Done;
+			PX4_INFO("my_mission: landed + disarmed");
+
+		} else if (tick.land.landed && _config.auto_disarm) {
+			// 已经判到着地，主动补一发 disarm（不等 PX4 那个 2 s）
+			enterState(State::Disarm, tick.now);
+			_last_disarm_cmd = 0;
+
+		} else if (elapsedSince(_state_start, tick.now) > _config.land_tmo) {
+			// 降不下去 / 着地检测一直不触发：退一步，直接尝试上锁并结束
+			PX4_WARN("my_mission: land timeout, trying to disarm");
+			enterState(State::Disarm, tick.now);
+			_last_disarm_cmd = 0;
+		}
+
+	} else {
+		// ---- 方式 0：纯 Offboard 下降 ----
+		// 自己把目标 z 以 MYM_DESC_RATE 一帧一帧地往"地面参考"抬。
+		// NED 里下降 = z 变大，所以是 + rate*dt，上限是 _ground_z。
+		// 用斜坡而不是直接跳到地面：位置环虽然也有速度限幅，但自己限速更可控，
+		// status 里看到的 setpoint 也是平滑的。
+		//
+		// 同时把 rate 当作 velocity[2] 前馈一起发出去 —— 这是让 land detector
+		// 能判"被指令下降"的唯一方式（MulticopterLandDetector.cpp:248），
+		// 没有它 landed 永远是 0，后面的 disarm 一定被 commander 拒。
+		// 下限是 1.1 * LNDMC_Z_VEL_MAX（默认 0.25 -> 0.275 m/s）：
+		// 低于它 _in_descend 就恒为 false，所以这里把参数抬上去并告警一次。
+		float desc_rate = _config.desc_rate;
+		const float min_vel = _external.inDescendMinVel();
+
+		if (desc_rate < min_vel) {
+			if (!_desc_rate_warned) {
+				_desc_rate_warned = true;
+				PX4_WARN("my_mission: MYM_DESC_RATE %.2f < %.2f (1.1*LNDMC_Z_VEL_MAX): raised, otherwise landing is undetectable",
+					 (double)desc_rate, (double)min_vel);
+			}
+
+			desc_rate = min_vel;
+		}
+
+		if (tick.pos_valid) {
+			_target(2) = math::min(_target(2) + desc_rate * tick.dt, _ground_z);
+		}
+
+		MissionOutput::Setpoint setpoint = targetSetpoint();
+		setpoint.z_velocity = desc_rate;
+		publishSetpoint(setpoint, tick.now);
+
+		if (!tick.armed.armed) {
+			_state = State::Done;
+
+		} else if (tick.land.landed || tick.land.maybe_landed) {
+			// **以 land detector 为准**收尾。
+			// 不能用"目标 z 到了 + vz 小了"这种宽松判据：那只是"物理上贴地了"，
+			// commander 的 disarm 检查要的是 land detector 的 landed/maybe_landed。
+			// 我们一直在发 velocity[2] 前馈，所以 detector 会在触地后约 1 秒内
+			// 依次满足 has_low_throttle -> ground_contact -> maybe_landed -> landed。
+			// 兜底是 MYM_LAND_TMO（默认 40 s），超时会走上面那条超时分支。
+			if (_config.auto_disarm) {
+				enterState(State::Disarm, tick.now);
+				_last_disarm_cmd = 0;
+				PX4_INFO("my_mission: land detector confirmed (%s), disarming",
+					 tick.land.landed ? "landed" : "maybe_landed");
+
+			} else {
+				_state = State::Done;
+			}
+		}
+	}
+}
+
+void MyMission::stateDisarm(const Tick &tick)
+{
+	// MAV_CMD_COMPONENT_ARM_DISARM 的 param1：1 = arm，0 = disarm。
+	// 这里 param1 = 0。param2 保持 0 = 普通上锁：PX4 会拒绝"空中上锁"，
+	// 只有 param2 = 21196（force）才允许在空中强行断动力 —— 那是紧急手段，
+	// 这里不用。
+	if (!tick.armed.armed) {
+		// ⚠ 这里**故意不刷 _state_start**（原实现就是这样）：Done 的接管检查窗口
+		// 因此是从进 DISARM 那一刻算的，而正常落地时它早就过了 1 s，等于不检查。
+		// 落地后本来也不会再掉高度，所以保持原样不动。
+		_state = State::Done;
+		PX4_INFO("my_mission: DISARMED");
+
+	} else {
+		// 1 Hz 重试：commander 可能因为"还没判到着地"拒绝一次，过一会再试。
+		if (_last_disarm_cmd == 0 || elapsedSince(_last_disarm_cmd, tick.now) > 1.f) {
+			_output.publishCommand(vehicle_command_s::VEHICLE_CMD_COMPONENT_ARM_DISARM, 0.f, 0.f);
+			_last_disarm_cmd = tick.now;
+		}
+
+		if (elapsedSince(_state_start, tick.now) > _config.disarm_tmo) {
+			PX4_WARN("my_mission: disarm timeout, giving up");
+			_state = State::Done;
+		}
+	}
+}
+
+void MyMission::stateDone(const Tick &tick)
+{
+	// 任务结束。仍然把 setpoint 钉在当前位置：如果飞手这时又切进 Offboard，
+	// 位置环的目标就是当前位置，不会飞回旧的悬停点。
+	holdCurrentPosition(tick.pos, tick.att, tick.pos_valid);
+	publishSetpoint(targetSetpoint(), tick.now);
+
+	// 已上锁 → 回到 WAIT：下一次 arm + 切 Offboard 会自动重跑整个流程。
+	if (!tick.armed.armed) {
+		enterState(State::Wait, tick.now);
+		_takeover_warned = false;   // 允许下一轮再告警
+	}
+}
+
+// ===========================================================================
+// 命令行
+// ===========================================================================
 int MyMission::custom_command(int argc, char *argv[])
 {
 	return print_usage("unknown command");
@@ -962,23 +734,40 @@ int MyMission::print_status()
 	PX4_INFO("target: [%.2f %.2f %.2f]  yaw %.3f  valid %d  ground_z %.2f",
 		 (double)_target(0), (double)_target(1), (double)_target(2), (double)_yaw_sp, _target_valid, (double)_ground_z);
 	PX4_INFO("land_mode %d  auto_disarm %d  alt %.2f m  hover %.1f s",
-		 (int)_param_mym_land_mode.get(), (int)_param_mym_auto_disarm.get(),
-		 (double)_param_mym_alt.get(), (double)_param_mym_hover.get());
+		 _config.land_mode, (int)_config.auto_disarm, (double)_config.alt, (double)_config.hover);
 	PX4_INFO("forward %.2f m  dir %.0f deg  tmo %.1f s  takeoff_yaw %.0f deg",
-		 (double)_param_mym_fwd_dist.get(), (double)_param_mym_fwd_dir.get(),
-		 (double)_param_mym_fwd_tmo.get(), (double)math::degrees(_takeoff_yaw));
+		 (double)_config.fwd_dist, (double)_config.fwd_dir_deg,
+		 (double)_config.fwd_tmo, (double)math::degrees(_takeoff_yaw));
+
+	// ---- 系绳测试 ----
+	vehicle_local_position_s local_pos{};
+	_local_pos_sub.copy(&local_pos);
+	const matrix::Vector3f here(local_pos.x, local_pos.y, local_pos.z);
+
+	if (_config.ropeEnabled()) {
+		PX4_INFO("rope %.1f m at %.1f deg  pitch_down %.1f deg",
+			 (double)_config.rope.rope_length, (double)_config.rope.rope_angle_deg,
+			 (double)_config.pitch_down_deg);
+		PX4_INFO("  anchor [%.2f %.2f %.2f]  taut [%.2f %.2f %.2f]  slant %.2f m",
+			 (double)_rope_solution.anchor(0), (double)_rope_solution.anchor(1), (double)_rope_solution.anchor(2),
+			 (double)_rope_solution.taut(0), (double)_rope_solution.taut(1), (double)_rope_solution.taut(2),
+			 (double)RopeGeometry::slant(_rope_solution.anchor, here));
+
+	} else {
+		PX4_INFO("rope disabled (MYR_ROPE_LEN = 0)");
+	}
 
 	// 接管安全：现在把模式开关拨出 Offboard 会不会掉高度？
 	manual_control_setpoint_s manual_control{};
 	_manual_control_sub.copy(&manual_control);
 
-	const bool centered = throttleStickCentered(manual_control);
+	const bool centered = TakeoverMonitor::throttleCentered(manual_control, _external.manDeadzone());
 
 	PX4_INFO("throttle %.2f -> %s (MAN_DEADZONE %.2f)  takeover_warned %d",
 		 (double)manual_control.throttle,
 		 centered ? "CENTERED (Position/Altitude will hold altitude)"
 		 : "OFF-CENTER (Position/Altitude will descend immediately)",
-		 (double)_man_deadzone, (int)_takeover_warned);
+		 (double)_external.manDeadzone(), (int)_takeover_warned);
 
 	return 0;
 }
@@ -995,17 +784,30 @@ int MyMission::print_usage(const char *reason)
 Offboard position-control mission demo for a multicopter:
 
   WAIT (armed + Offboard) -> TAKEOFF (MYM_ALT)
-  -> FORWARD (MYM_FWD_DIST along the takeoff heading, skipped when 0)
-  -> HOVER (MYM_HOVER) -> LAND (offboard descent or PX4 AUTO_LAND) -> DISARM -> DONE
+  -> FORWARD (one destination, chosen when the takeoff completes:
+                rope on  -> the point where a MYR_ROPE_LEN rope at MYR_ROPE_ANGLE
+                            is just taut; MYM_FWD_DIST / MYM_FWD_DIR are ignored
+                rope off -> MYM_FWD_DIST along the takeoff heading, offset by
+                            MYM_FWD_DIR
+              skipped when neither is configured)
+  -> TILT (rope destination only: hold the taut point and pitch MYR_PITCH_DOWN
+     degrees nose down for MYR_TILT_HOLD seconds, altitude unchanged)
+  -> HOVER (MYM_HOVER, forward destination and no-destination cases)
+  -> LAND (offboard descent or PX4 AUTO_LAND) -> DISARM -> DONE
+
+The rope geometry is latched when the takeoff completes: the anchor is
+MYR_ANCHOR_{X,Y,Z} from the takeoff point in the level body frame (forward /
+right / down, so MYR_ANCHOR_Z is positive downwards), and the taut point sits
+MYR_ROPE_LEN*cos(MYR_ROPE_ANGLE) ahead of it along the takeoff heading and
+MYR_ROPE_LEN*sin(MYR_ROPE_ANGLE) above it. The destination type is latched with
+it -- changing MYR_ROPE_LEN in flight does not change where this run goes.
+
+TILT is realised as an acceleration feedforward of g*tan(MYR_PITCH_DOWN) along
+the takeoff heading; the rope holds the vehicle back, so the resulting attitude
+is the requested pitch with the position essentially unchanged.
 
 Publishes offboard_control_mode{position=true} and trajectory_setpoint at 50 Hz,
 and uses vehicle_command for landing/disarming.
-
-### Examples
-Start the module, then arm and switch to Offboard:
-$ my_mission start
-$ commander arm
-$ commander mode offboard
 
 )DESCR_STR");
 

@@ -8,6 +8,11 @@ parameters:
         long: |-
           进入 Offboard 后相对"进入点"（通常是地面）上升多少，单位 m。
           目标位置 = 进入时的位置，z 再减去这个值（NED 向上为负）。
+
+          ⚠ 开了系绳测试（MYR_ROPE_LEN > 0）时，这个高度**必须明显小于绳长**：
+          飞机在起飞点正上方，斜距就等于这个值，一旦超过绳长，绳会在爬升途中
+          绷紧把飞机拽住，表现为"爬不到 MYM_ALT、MYM_TKO_TMO 超时转降落"。
+          经验：绳长至少给这个值的 3 倍（MYM_ALT=2 时绳长 ≥ 6 m，推荐 10 m）。
       type: float
       default: 1.5
       decimal: 2
@@ -21,6 +26,8 @@ parameters:
           到了 MYM_ALT 之后，沿"起飞那一刻锁定的机头方向"（不是正北）再平飞这么远，
           到点后悬停 MYM_HOVER 秒再降落。单位 m。
           0 = 不飞：跳过 FORWARD 状态，行为和不启用这个功能时完全一样。
+          **开了系绳测试（MYR_ROPE_LEN > 0）时这个参数失效** —— 目的地被
+          绷紧点接管，绳优先。
           方向由航向估计决定（GPS 双天线 / 磁罗盘 / EKF），航向歪多少度就飞歪多少度，
           距离越大偏得越远。第一次试先给小值（1~2 m），MYM_ALT 给高一点。
       type: float
@@ -35,7 +42,7 @@ parameters:
         long: |-
           相对"起飞时的机头方向"再偏多少度，用来往侧面飞。
           0 = 正前方，+90 = 起飞航向的右侧，-90 = 左侧，180 = 正后方。
-          只在 MYM_FWD_DIST > 0 时有意义。
+          只在 MYM_FWD_DIST > 0 时有意义；开了系绳测试时也失效（目的地是绷紧点）。
       type: float
       default: 0.0
       decimal: 1
@@ -46,9 +53,10 @@ parameters:
       description:
         short: 前飞巡航速度
         long: |-
-          平飞段的最高速度，单位 m/s。起飞到点后，位置目标点不是一下子跳过去，
-          而是按这个速度一点点推过去（配合 MYM_FWD_ACC 走"加速-匀速-减速"三段），
-          所以实际地速基本等于这个值。
+          FORWARD 段的巡航速度上限，单位 m/s。位置目标不是一下子跳过去，
+          而是交给 PX4 的 PositionSmoothing 按这个速度规划（配合 MYM_FWD_ACC
+          走"加速-匀速-减速"三段）。
+          飞绷紧点时也用这个值 —— 那一段是爬升 + 前飞一起走的。
           给小：慢、姿态平；给大：快、但倾角也大。
           注意这是**惯性系**速度（对地），顶风时地速等于它、空速会更高。
       type: float
@@ -61,8 +69,9 @@ parameters:
       description:
         short: 前飞加/减速度上限
         long: |-
-          加速段和减速段的加速度绝对值上限，单位 m/s^2。**这是决定姿态变化大小的
-          那个参数**：平飞需要的倾角大约是 atan(加速度 / 9.81)。
+          加速段和减速段的加速度绝对值上限，单位 m/s^2（爬升段也用）。
+          **这是决定姿态变化大小的那个参数**：平飞需要的倾角大约是
+          atan(加速度 / 9.81)。
           1.0 -> 约 6 度，2.0 -> 约 12 度，5.0 -> 约 27 度。
           太小则速度爬升很慢（短距离时全程都在加减速，永远到不了 MYM_FWD_SPD）。
           经验值：留 2 倍以上的余量给抗风，比赛/演示场合 1.0 ~ 2.0 最舒服。
@@ -75,10 +84,13 @@ parameters:
       unit: m/s^2
     MYM_FWD_TMO:
       description:
-        short: 前飞超时
+        short: FORWARD 段超时
         long: |-
-          超过这个时间还没到达前飞目标点（航向估计歪 / 顶风 / EKF 位置漂 /
+          超过这个时间还没到达目的地（航向估计歪 / 顶风 / EKF 位置漂 /
           MYM_ARRIVE 太小），就不再硬追，直接进入降落流程。
+          **飞绷紧点时也用这个超时**，而那一段比前飞长得多（水平 L*cosθ +
+          竖直 L*sinθ），所以开绳时必须放大：10 m 绳实测约 11 s，给 60；
+          30 m 绳约 30 s，给 90 以上。
       type: float
       default: 20.0
       decimal: 1
@@ -88,6 +100,10 @@ parameters:
     MYM_HOVER:
       description:
         short: 到达目标点后的悬停时间
+        long: |-
+          到达**前方点**后保持多久再开始降落，单位 s。
+          只在"没有开绳"的路上用到（开了绳到的是绷紧点，那一段用 MYR_TILT_HOLD）。
+          另外"既没开绳、MYM_FWD_DIST 也是 0"的情况下，起飞后也是悬停这么久再降落。
       type: float
       default: 5.0
       decimal: 1
@@ -183,3 +199,139 @@ parameters:
       min: 1.0
       max: 60.0
       unit: s
+
+    # ===================================================================
+    # 系绳（拉绳）测试 MYR_*
+    # ===================================================================
+    # 参数全名是 MYR_ 开头（My Rope）。整段的几何只由这 6 个参数决定：
+    #
+    #   锚点   = 起飞点 + 机体系(MYR_ANCHOR_X, Y, Z)     （地面上的系绳桩）
+    #   绷紧点 = 锚点沿起飞航向水平 L*cos(θ)，再往上 L*sin(θ)
+    #            L = MYR_ROPE_LEN，θ = MYR_ROPE_ANGLE
+    #   到绷紧点后低头 MYR_PITCH_DOWN 度，高度不变
+    #
+    # 绷紧点就是"绳子刚好拉直、但还没产生拉力"的位置：斜距正好 = L，
+    # 绳和地面的夹角正好 = θ。再往前一点绳才开始出力。
+    #
+    # ⚠ 绳子的物理实体在仿真里由 gz 的 TetherPlugin 提供，**两边必须填同一个数**：
+    #     export GZ_TETHER=1
+    #     export GZ_TETHER_LEN=<和 MYR_ROPE_LEN 相同的值>
+    #   或者直接改 model.sdf 里 <rope_length>。飞控这侧只负责把飞机飞到几何上
+    #   该在的位置，它并不知道绳到底绷没绷 —— 两边不一致就会出现"飞过头被拽回来"
+    #   或者"绳一直松着"。
+    MYR_ANCHOR_X:
+      description:
+        short: 系绳锚点的前后位置（机体系，前为正）
+        long: |-
+          地面系绳点相对**起飞点**的前后偏移，单位 m，沿起飞那一刻的机头方向。
+          和 MYR_ANCHOR_Y / MYR_ANCHOR_Z 一起构成"地面机体坐标系"（只含航向、
+          不含倾斜；X 前 / Y 右 / Z 下）。
+          默认 0 = 锚点就在起飞点正下方，这时就不用再改 SDF 的
+          <anchor_offset>，两边自动一致。
+          一般保持 0：绳的方向由 MYR_ROPE_ANGLE 和起飞航向决定，不需要靠挪锚点来摆。
+      type: float
+      default: 0.0
+      decimal: 2
+      min: -100.0
+      max: 100.0
+      unit: m
+    MYR_ANCHOR_Y:
+      description:
+        short: 系绳锚点的左右位置（机体系，右为正）
+        long: |-
+          地面系绳点相对起飞点的左右偏移，单位 m，右为正。
+          非 0 时 SDF 里的 <anchor_offset> 也要改（gz 那个是**世界系** ENU：
+          x 东、y 北、z 上），换算起来容易出错，所以除非确实需要，保持 0。
+      type: float
+      default: 0.0
+      decimal: 2
+      min: -100.0
+      max: 100.0
+      unit: m
+    MYR_ANCHOR_Z:
+      description:
+        short: 系绳锚点的高低（机体系，下为正）
+        long: |-
+          地面系绳点相对起飞点的高低偏移，单位 m，**向下为正**（NED 同号，不用换）。
+          锚点在地面上时填 0（默认）。锚点挂在高处（比如塔上、杆上）时填负值，
+          例如锚点在起飞点上方 3 m 就填 -3。
+      type: float
+      default: 0.0
+      decimal: 2
+      min: -100.0
+      max: 100.0
+      unit: m
+    MYR_ROPE_LEN:
+      description:
+        short: 绳长（0 = 不做系绳测试）
+        long: |-
+          绳子的长度，单位 m。**0 = 关闭系绳段**，任务行为和没有这个功能时
+          完全一样（WAIT -> TAKEOFF -> [FORWARD] -> HOVER -> LAND）。
+          大于 0 时它**接管 FORWARD 的目的地**：飞机不再飞 MYM_FWD_DIST，
+          而是飞向"斜距正好等于这个绳长"的绷紧点，到位后进 TILT 低头。
+          两个都配了也只听绳的 —— MYM_FWD_DIST / MYM_FWD_DIR 失效。
+
+          ⚠ 三条选值的判据：
+          1) **必须明显大于 MYM_ALT**（建议 ≥ 3 倍）。起飞点正上方的斜距就等于
+             MYM_ALT，绳比它短的话爬升途中就被拽住，表现为起飞超时。
+          2) 绷紧点高度 = L*sin(θ)，水平 = L*cos(θ)，这一段要在 MYM_FWD_TMO
+             内飞完（10 m 绳实测约 11 s）。
+          3) 必须和 gz 里 TetherPlugin 的绳长一致（GZ_TETHER_LEN 或 SDF 的
+             <rope_length>，见上面这组参数的总说明）。
+
+          参考量级（θ=30°、起飞高度 2 m）：L=10 m → 水平 8.66 m、高 5.0 m。
+      type: float
+      default: 0.0
+      decimal: 1
+      min: 0.0
+      max: 200.0
+      unit: m
+    MYR_ROPE_ANGLE:
+      description:
+        short: 绷紧时绳和地面的夹角
+        long: |-
+          到达绷紧点时，绳与地面的夹角，单位度。绷紧点因此位于
+          "距锚点水平 L*cos(θ)、高出 L*sin(θ)"的位置。
+          角度大 -> 飞机悬得高、离锚点近；角度小 -> 贴地飞得远、张力的水平分量大。
+          绳的竖直分量 T*sin(θ) 会把飞机往下拽，这部分由位置环补总距吸收，
+          所以角度越大、同样的低头角对应的绳张力越小而竖直负载越大。
+      type: float
+      default: 30.0
+      decimal: 1
+      min: 1.0
+      max: 89.0
+      unit: deg
+    MYR_TILT_HOLD:
+      description:
+        short: 绷紧点上低头保持多久
+        long: |-
+          到达绷紧点、开始低头之后，保持多少秒再转降落，单位 s。
+          **和 MYM_HOVER 完全独立**：MYM_HOVER 只管"没开绳时到前方点后悬停多久"，
+          这里管"开了绳低头保持多久"，两边可以按需要差很远。
+          0 = 一到绷紧点就开始降落（几乎看不到低头）。
+          实测低头姿态大约 1 s 内建立（PITCH 从 0 到 -14°），所以想看清稳态
+          至少给 5 s 以上。
+      type: float
+      default: 10.0
+      decimal: 1
+      min: 0.0
+      max: 600.0
+      unit: s
+    MYR_PITCH_DOWN:
+      description:
+        short: 绷紧点上的低头角
+        long: |-
+          到达绷紧点后低头多少度（正 = 低头），高度不变（由位置环维持）。
+          实现方式：给位置环一个沿航向的**加速度前馈** a = g*tan(φ)，而
+          加速度到姿态的映射就是 倾角 = atan(a/g)，所以稳态姿态正好是 φ。
+          低头之后飞机想往前冲，绳拉住它 -> 位置误差≈0 -> 姿态稳定在 φ。
+          **会被夹到 MPC_TILTMAX_AIR 以内**（默认 45°），超了会告警并夹住。
+          φ=20° 时绳张力约 14.6 N，φ=30° 约 23.1 N（都不含推力电机）。
+          0 = 不低头：TILT 段照常保持 MYR_TILT_HOLD 秒，只是姿态保持水平。
+          这一段前推力辅助不会出力：位置误差≈0，没有"缺额"可用。
+      type: float
+      default: 15.0
+      decimal: 1
+      min: -45.0
+      max: 45.0
+      unit: deg

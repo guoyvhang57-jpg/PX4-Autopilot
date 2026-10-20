@@ -37,6 +37,17 @@ px4_add_module(
 	SRCS
 		MyMission.cpp
 		MyMission.hpp
+		ExternalParams.cpp
+		ExternalParams.hpp
+		MissionConfig.hpp
+		MissionOutput.cpp
+		MissionOutput.hpp
+		RopeGeometry.cpp
+		RopeGeometry.hpp
+		TakeoverMonitor.cpp
+		TakeoverMonitor.hpp
+		TransitLeg.cpp
+		TransitLeg.hpp
 	MODULE_CONFIG
 		my_mission_params.yaml
 	DEPENDS
