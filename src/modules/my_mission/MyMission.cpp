@@ -382,6 +382,19 @@ void MyMission::Run()
 // ===========================================================================
 // 状态函数
 // ===========================================================================
+
+/**
+ * @brief TILT 加速度前馈的斜坡速率 [m/s^2 per s]
+ *
+ * **写死，不做参数**：它只影响"进入和离开低头那一刻"的平滑度，和飞行性能无关，
+ * 现场没有调它的理由，多一个参数只是多一个能设错的地方。
+ *
+ * 取 2.5 的依据：15° 的低头对应 a = g*tan(15°) = 2.63 m/s^2，用 1.05 s 建立，
+ * 也就是姿态平均约 14 °/s。阶跃时实测进入是 64 °/s、离开 73 °/s 的角速度尖峰，
+ * 斜坡把它压掉一个量级，而且姿态是"爬上去/退下来"，不是被推一把。
+ */
+static constexpr float kTiltFfSlew = 2.5f;
+
 void MyMission::stateWait(const Tick &tick)
 {
 	// 进 Offboard 之前：目标 = 当前位置。位置环就算已经在跑也不会动。
@@ -488,6 +501,7 @@ void MyMission::stateForward(const Tick &tick)
 			// a_ff 为 0，TILT 照常保持 MYM_HOVER 秒再降落）。
 			enterState(State::Tilt, tick.now);
 			_last_rope_log = 0;
+			_tilt_ff = 0.f;   // 从 0 开始爬
 			PX4_INFO("my_mission: taut point reached [%.2f %.2f %.2f] (slant %.2f m), TILT %.1f deg down",
 				 (double)_goal3(0), (double)_goal3(1), (double)_goal3(2),
 				 (double)RopeGeometry::slant(_rope_solution.anchor, _goal3),
@@ -545,11 +559,26 @@ void MyMission::stateTilt(const Tick &tick)
 			 (double)_config.pitch_down_deg, (double)_external.mpcTiltmaxAir());
 	}
 
-	const float a_ff = CONSTANTS_ONE_G * tanf(math::radians(pitch_down));
+	const float a_full = CONSTANTS_ONE_G * tanf(math::radians(pitch_down));
+
+	// ---- 前馈斜坡 ----
+	// 保持时间内目标 = a_full；保持时间到了就把目标改成 0，先退回来再转降落。
+	// 直接阶跃会在进入、离开各打一次 60~70 °/s 的角速度尖峰（实测），
+	// 斜坡之后姿态是平滑地爬上去、退下来。
+	const bool holding = elapsedSince(_state_start, tick.now) < _config.tilt_hold;
+	const float a_target = holding ? a_full : 0.f;
+	const float a_step = kTiltFfSlew * tick.dt;
+
+	if (_tilt_ff < a_target) {
+		_tilt_ff = math::min(_tilt_ff + a_step, a_target);
+
+	} else if (_tilt_ff > a_target) {
+		_tilt_ff = math::max(_tilt_ff - a_step, a_target);
+	}
 
 	// 沿起飞航向的加速度前馈；z 给 NaN = 不做前馈，让位置环自己维持高度。
 	MissionOutput::Setpoint setpoint = targetSetpoint();
-	setpoint.acceleration = matrix::Vector3f(a_ff * cosf(_takeoff_yaw), a_ff * sinf(_takeoff_yaw), NAN);
+	setpoint.acceleration = matrix::Vector3f(_tilt_ff * cosf(_takeoff_yaw), _tilt_ff * sinf(_takeoff_yaw), NAN);
 	publishSetpoint(setpoint, tick.now);
 
 	// 1 Hz 打一次实测的斜距 / 绳角 / 俯仰，和 gz 那边的张力遥测对表：
@@ -570,10 +599,16 @@ void MyMission::stateTilt(const Tick &tick)
 
 	// 保持时间用 MYR_TILT_HOLD，**不是 MYM_HOVER** —— 低头保持多久和
 	// "没开绳时到前方点悬停多久"是两件独立的事，共用一个参数会互相牵制。
-	if (elapsedSince(_state_start, tick.now) >= _config.tilt_hold) {
+	//
+	// 注意退出条件是"时间到 **且** 前馈已经退回 0"：斜坡退回来还要
+	// |a_full|/kTiltFfSlew 秒（15° 约 1.05 s），所以 TILT 的总时长比
+	// MYR_TILT_HOLD 多出这一段。不能在还歪着的时候切走 —— 那正是原来
+	// 73 °/s 尖峰的来源。
+	if (!holding && (fabsf(_tilt_ff) < 1e-3f)) {
 		enterState(State::Land, tick.now);
 		_land_cmd_sent = false;
-		PX4_INFO("my_mission: TILT done (%.1f s), LAND (mode %d)", (double)_config.tilt_hold, _config.land_mode);
+		PX4_INFO("my_mission: TILT done (%.1f s + ramp), LAND (mode %d)", (double)_config.tilt_hold,
+			 _config.land_mode);
 	}
 }
 

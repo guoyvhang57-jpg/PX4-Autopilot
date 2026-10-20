@@ -188,6 +188,7 @@ private:
 	hrt_abstime _state_start{0};      ///< 进入当前状态的时刻，用来算超时/悬停计时
 	hrt_abstime _last_disarm_cmd{0};  ///< 上次发 disarm 的时刻，DISARM 状态里做 1 Hz 重试
 	hrt_abstime _last_rope_log{0};    ///< TILT 里 1 Hz 打一次斜距/绳角，和 gz 遥测对表
+	float _tilt_ff{0.f};              ///< TILT 当前实际发出的加速度前馈 [m/s^2]（斜坡后的值）
 	hrt_abstime _last_run{0};         ///< 上一拍的时刻，用来算真实的 dt（平滑器靠 dt 推进）
 	bool _land_cmd_sent{false};       ///< NAV_LAND 是"切模式"命令，只在进 LAND 时发一次
 	bool _target_valid{false};        ///< false 时 trajectory_setpoint 的位置发 NaN
