@@ -114,7 +114,7 @@ private:
 	uORB::Subscription _my_mission_assist_sub{ORB_ID(my_mission_assist)};	/**< 前推力辅助的阶段许可 */
 
 	hrt_abstime _assist_timestamp{0};		/**< 上一帧阶段许可的时间戳，用来判超时 */
-	bool _assist_enabled_by_mission{true};		/**< 没收到或超时时按"允许"处理 */
+	bool _assist_enabled_by_mission{false};		/**< 没收到或超时时按"禁止"处理（fail-closed） */
 
 	hrt_abstime _time_stamp_last_loop{0};		/**< time stamp of last loop iteration */
 	hrt_abstime _time_position_control_enabled{0};

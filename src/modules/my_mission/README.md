@@ -36,11 +36,10 @@ Offboard 位置控制的最小任务示例：**起飞到指定高度 → 向前�
 
 ```
 WAIT ──手势解锁 + 进 Offboard──>
-       ├─ 开绳 + 已离地 + 离 home > MYM_ARRIVE ──> TILT（手动进场，不爬升、不飞中转）
-       └─ 否则 ──> TAKEOFF ──到达 MYM_ALT──>
-                    ├─ MYR_ROPE_EN = 1 ──> TILT ──MYR_TILT_HOLD 秒──> HOVER
-                    ├─ MYM_FWD_DIST > 0 ──> FORWARD ──到位─────────> HOVER
-                    └─ 都没有 ───────────────────────────────────> HOVER
+       ├─ 离地 + 离 home > MYM_ARRIVE ──> TILT（手动进场 = 拉绳测试，无开关）
+       └─ 地面上 ──> TAKEOFF ──到达 MYM_ALT──>
+                    ├─ MYM_FWD_DIST > 0 ──> FORWARD ──到位──> HOVER
+                    └─ MYM_FWD_DIST = 0 ───────────────────> HOVER
      ──MYM_HOVER 秒──> RETURN（先对准 home，再飞回去）──到位──> LAND
      ──> DISARM ──> DONE ──(已上锁)──> WAIT（可以再跑一遍）
 ```
@@ -63,9 +62,11 @@ WAIT ──手势解锁 + 进 Offboard──>
 
 | 配置 | 做什么 | 之后 |
 |---|---|---|
-| `MYR_ROPE_EN = 1` | 直接 `TILT`，目标留在起飞点上空 | 悬停 `MYM_HOVER` 秒后降落 |
-| `MYM_FWD_DIST > 0` | `FORWARD` 飞到起飞点前方 `MYM_FWD_DIST` 米 | `HOVER` |
-| 都没有 | 不飞 | 直接 `HOVER` |
+| `MYM_FWD_DIST > 0` | `FORWARD` 飞到 home 前方 `MYM_FWD_DIST` 米 | `HOVER` |
+| `MYM_FWD_DIST = 0` | 不飞 | 直接 `HOVER` |
+
+**进场方式决定走哪条路，没有开关**：离地后切 Offboard = 拉绳测试；
+在地面切 Offboard = 正常起飞流程。
 
 实际的操作顺序（先切模式再解锁、手势怎么做、要设哪些参数）见下面
 [操作顺序](#操作顺序先切-offboard再用手势解锁) 一节。
@@ -137,13 +138,20 @@ WAIT ──手势解锁 + 进 Offboard──>
 | `MYM_AUTO_DISARM` | 1 | 着地后由本模块发 disarm |
 | `MYM_DISARM_TMO` | 10 s | 上锁超时 |
 
-## 拉绳测试（`MYR_ROPE_EN = 1`）
+## 拉绳测试（离地后切 Offboard）
 
-打开开关之后有两条进场方式：
+**没有开关**，判定条件就是进场方式：**离地之后**才切进 Offboard，就认定是拉绳测试，
+`WAIT` 直接进 `TILT`。条件三条：
 
-**地面起飞** —— `TAKEOFF` 到位直接进 `TILT`，不飞中转段。
+1. 已经离地（land detector 说不在接触地面）
+2. 到 **home** 的三维距离 > `MYM_ARRIVE`
+3. 切 Offboard 那一刻
 
-**手动进场** —— 先用手动模式（POSCTL）把飞机飞到绳快要绷紧的地方，再切 Offboard。
+在地面 arm 之后再切 Offboard 的那一趟**永远不拉**，走 `TAKEOFF → FORWARD/HOVER →
+RETURN → LAND`。
+
+⚠ 这条规则是"离地就拉"：只要你在 POSCTL 里飞起来再切 Offboard，它就会低头。
+不想拉就不要在空中切 Offboard。
 `WAIT` 里一看到 Offboard 就判断"到 **PX4 `home_position`** 的三维距离"（那个点
 在**解锁那一刻**设，每次解锁都重设，语义是"这一趟从哪起飞"），超过 `MYM_ARRIVE`
 且**已经离地**，就跳过起飞直接进 `TILT`，三轴目标都取当前位置（不套 `MYM_ALT`）。
@@ -209,10 +217,32 @@ MYR_FWD_THR > 0  ->  a = g * ( tan(上限) + MYR_FWD_THR / SC )    姿态 = 上�
 
 | 参数 | 默认 | 说明 |
 |---|---|---|
-| `MYR_ROPE_EN` | 0 | 拉绳测试开关（0 关 / 1 开） |
 | `MYR_PITCH_DOWN` | 15° | 目标低头角，0~15；**油门为 0 时才生效** |
 | `MYR_TILT_HOLD` | 10 s | 拉多久 |
 | `MYR_FWD_THR` | 0.00 | 前推力电机油门；一给，姿态就钉在 15° |
+
+## 前推力辅助（谁允许、什么时候允许）
+
+四个门槛，全真才出力：
+
+| # | 门槛 | 谁说了算 |
+|---|---|---|
+| ① | `MYM_FWD_THR_EN != 0` | 用户参数，总开关 |
+| ② | 在 Offboard 里 | `vehicle_control_mode.flag_control_offboard_enabled` |
+| ③ | 阶段许可 | 本模块每拍发的 `my_mission_assist.enabled` |
+| ④ | 需求角 > `MYM_PITCH_MIN` | `PositionControl` 算缺额，> 0 才有推力 |
+
+③ 只在两个阶段为真：
+
+- `TILT`（拉绳段）—— 整段
+- `FORWARD` 的加速段和巡航段 —— 沿航向加速度翻负并持续 0.2 s 后闩锁，本段余下时间关掉
+
+其余状态（`TAKEOFF` / `HOVER` / `RETURN` / `LAND` / `DISARM` / `DONE` / `WAIT`）一律为假。
+
+**超时按"禁止"处理（fail-closed）。** 控制器 500 ms 收不到 `my_mission_assist` 就认为
+辅助关闭。代价是这条路变成 `my_mission` 专用：用 MAVSDK / ROS 2 飞 Offboard 时拿不到
+辅助（它们不发这个话题）。好处是模块崩了、被 `my_mission stop` 停了，推力电机立刻
+回到"不参与"，不会在没人管的时候继续出力。
 
 ## 操作顺序：先切 Offboard，再用手势解锁
 

@@ -9,10 +9,7 @@ parameters:
           进入 Offboard 后相对 **home 的地面** 上升多少，单位 m。
           起飞点 = home 的 x/y，目标 z = home 的 z 减去这个值（NED 向上为负）。
 
-          ⚠ 拉绳测试（MYR_ROPE_EN = 1）时，绳的几何要摆成"爬到这个高度时绳已经
-          绷紧或者刚好绷紧"。绳长在 SDF 的 <rope_length> 里、锚点在 <anchor_offset>
-          里，都在仿真那边，模块不参与计算。绳明显长于这个高度的话，低头之后飞机
-          只会往前飞，测不到拉力。
+          地面起飞这条路和拉绳测试无关（拉绳测试只在"离地后切 Offboard"时进入）。
       type: float
       default: 1.5
       decimal: 2
@@ -27,8 +24,7 @@ parameters:
           到点后悬停 MYM_HOVER 秒，然后返航回 home、降落。单位 m。
           **起点是 home**（解锁时设的点），不是"进入 Offboard 时的位置"。
           0 = 不飞：跳过 FORWARD 状态，行为和不启用这个功能时完全一样。
-          拉绳测试（MYR_ROPE_EN = 1）时这个参数**不生效**：那一段是 TAKEOFF 直接进
-          TILT，不飞中转。
+          拉绳测试不走 FORWARD，这个参数那一段不生效。
           方向由航向估计决定（GPS 双天线 / 磁罗盘 / EKF），航向歪多少度就飞歪多少度，
           距离越大偏得越远。第一次试先给小值（1~2 m），MYM_ALT 给高一点。
       type: float
@@ -200,41 +196,21 @@ parameters:
       unit: s
 
     # ===================================================================
-    # 系绳（拉绳）测试 MYR_*
+    # 拉绳测试 MYR_*
     # ===================================================================
-    # 一个开关 + 三个执行量，**不算任何几何**：
+    # **没有开关**：判定条件就是进场方式——
     #
-    #   MYR_ROPE_EN    = 1：TAKEOFF 到位后直接进 TILT，目标留在起飞点上空，
-    #                       按 MYR_PITCH_DOWN / MYR_FWD_THR 发一条沿起飞航向的
-    #                       加速度前馈，保持 MYR_TILT_HOLD 秒，然后悬停、降落。
+    #   离地之后才切进 Offboard   -> 认定是拉绳测试，直接进 TILT
+    #   在地面 arm 再切 Offboard  -> 正常起飞流程（TAKEOFF -> FORWARD/HOVER -> ...）
+    #
+    # 也就是说：手动（POSCTL）把飞机飞到绳快绷紧的地方，再切 Offboard，就开始拉。
+    # 地面起飞那趟永远不会拉。
+    #
+    # TILT 的动作：目标留在当前位置（水平误差≈0，需求只剩前馈），
+    # 沿起飞航向发一条加速度前馈，保持 MYR_TILT_HOLD 秒，然后悬停、返航、降落。
     #
     # 绳本身在仿真里：SDF 的 <rope_length> / <anchor_offset> / <stiffness>，
-    # 或者启动时 GZ_TETHER=1 GZ_TETHER_LEN=<m> 覆盖。测试的摆法是让飞机在
-    # 爬到 MYM_ALT 时绳**已经绷紧**，所以模块不需要知道绳有多长、拴在哪。
-    MYR_ROPE_EN:
-      description:
-        short: 拉绳测试开关
-        long: |-
-          0 = 关闭：任务走普通流程（TAKEOFF -> [FORWARD] -> HOVER -> LAND）。
-          1 = 打开：TAKEOFF 到位后**直接**进 TILT，不飞中转段，也不算绷紧点。
-
-          打开时这几件事一起生效：
-            - 目标一直留在起飞点上空（位置环维持高度和水平位置）
-            - 沿起飞航向发一条加速度前馈，大小由 MYR_PITCH_DOWN / MYR_FWD_THR 反解
-            - 保持 MYR_TILT_HOLD 秒，然后退回前馈、转 HOVER
-
-          两种进场方式都被识别：
-            - 在地面 arm 再切 Offboard -> 正常起飞到 MYM_ALT 后进 TILT
-            - 先手动飞到绳快绷紧的地方再切 Offboard -> 离 home 超过 MYM_ARRIVE
-              且已经离地，就直接进 TILT，不爬升、不飞中转
-
-          ⚠ 仿真里必须让绳在起飞时就绷紧（GZ_TETHER=1，绳长和锚点按现场摆）。
-          否则飞机低头之后只会往前飞，测不到拉力。
-      type: enum
-      values:
-        0: 关闭
-        1: 打开
-      default: 0
+    # 或者启动时 GZ_TETHER=1 GZ_TETHER_LEN=<m> 覆盖。飞控不建模绳子。
     MYR_PITCH_DOWN:
       description:
         short: 拉绳时的目标低头角（油门为 0 才生效）

@@ -246,7 +246,6 @@ private:
 		(ParamFloat<px4::params::MYM_LAND_TMO>) _param_mym_land_tmo,
 		(ParamInt<px4::params::MYM_AUTO_DISARM>) _param_mym_auto_disarm,
 		(ParamFloat<px4::params::MYM_DISARM_TMO>) _param_mym_disarm_tmo,
-		(ParamInt<px4::params::MYR_ROPE_EN>) _param_myr_rope_en,
 		(ParamFloat<px4::params::MYR_PITCH_DOWN>) _param_myr_pitch_down,
 		(ParamFloat<px4::params::MYR_TILT_HOLD>) _param_myr_tilt_hold,
 		(ParamFloat<px4::params::MYR_FWD_THR>) _param_myr_fwd_thr

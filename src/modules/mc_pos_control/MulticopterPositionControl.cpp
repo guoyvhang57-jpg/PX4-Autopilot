@@ -412,7 +412,9 @@ void MulticopterPositionControl::Run()
 		_vehicle_land_detected_sub.update(&_vehicle_land_detected);
 
 		// 任务模块的阶段许可（前推力辅助）。发 false 时位置环完全回到原逻辑：
-		// 不夹低头角、不产出前推力。超时按"允许"处理 —— 模块挂掉不能静默把辅助关死。
+		// 不夹低头角、不产出前推力。
+		// **超时按"禁止"处理**：模块没在发就是没在管，辅助退回关闭。代价是这条路
+		// 变成 my_mission 专用 —— 用别的模块（MAVSDK / ROS 2）飞 Offboard 时辅助不会工作。
 		{
 			my_mission_assist_s assist{};
 
@@ -422,7 +424,7 @@ void MulticopterPositionControl::Run()
 			}
 
 			if (hrt_absolute_time() - _assist_timestamp > 500_ms) {
-				_assist_enabled_by_mission = true;
+				_assist_enabled_by_mission = false;
 			}
 		}
 

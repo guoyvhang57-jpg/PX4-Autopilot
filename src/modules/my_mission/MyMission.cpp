@@ -167,7 +167,6 @@ void MyMission::refreshConfig()
 	_config.auto_disarm = (_param_mym_auto_disarm.get() != 0);
 	_config.disarm_tmo = _param_mym_disarm_tmo.get();
 
-	_config.rope_test = (_param_myr_rope_en.get() != 0);
 	_config.pitch_down_deg = _param_myr_pitch_down.get();
 	_config.tilt_hold = _param_myr_tilt_hold.get();
 	_config.fwd_thr = _param_myr_fwd_thr.get();
@@ -352,7 +351,7 @@ void MyMission::Run()
 	publishControlMode(now);
 
 	// ---- 前推力辅助的阶段许可 ----
-	// 每拍都发（含 WAIT/DONE）：控制器用 500 ms 超时判活，断流会退回"允许"。
+	// 每拍都发（含 WAIT/DONE）：控制器用 500 ms 超时判活，断流按"禁止"处理。
 	// 只在"需要往前加速"的时候开：
 	//   TILT     —— 整个拉绳段都要，这是它存在的意义
 	//   FORWARD  —— 加速段和巡航段要，**减速段关掉**（姿态抬头，没有力要交出去）
@@ -467,7 +466,9 @@ void MyMission::stateWait(const Tick &tick)
 		//
 		// ⚠ 必须要求 !landed：地上的飞机被人挪过位置（离原点 > MYM_ARRIVE）时，
 		// 一进 Offboard 就会坐在地上拉绳，会翻。
-		if (_config.rope_test && !tick.land.landed && (dist_home > _config.arrive)) {
+		// 只要**离地之后**才切进 Offboard，就认定是拉绳测试。
+		// 地面 arm 完直接切 -> 走下面的正常起飞流程。
+		if (!tick.land.landed && (dist_home > _config.arrive)) {
 			// 三轴都用当前值：手动飞过来的高度就是拉绳高度，不套 MYM_ALT。
 			// （拉绳点就是飞手停的那个地方，这是唯一一个**有意**不以 home 为准的
 			//   位置 —— 它的定义就是"飞机现在在哪"。）
@@ -506,21 +507,12 @@ void MyMission::stateTakeoff(const Tick &tick)
 
 	if (reachedTarget(tick.pos)) {
 		// ===============================================================
-		// TAKEOFF 到位后二选一
+		// TAKEOFF 到位后只有一个去向：前方点
 		// ===============================================================
-		// 开绳   -> **直接进 TILT**。绳在起飞那一刻就已经绷紧（或几乎绷紧），
-		//           没有什么"绷紧点"要算、也不需要先飞一段。目标留在起飞点上空，
-		//           由位置环维持；TILT 只负责发沿航向的加速度前馈。
-		// 没开绳 -> FORWARD：飞 MYM_FWD_DIST，到位后 HOVER。
-		if (_config.rope_test) {
-			_tilt_ff = 0.f;
-			_last_rope_log = 0;
-			enterState(State::Tilt, tick.now);
-			PX4_INFO("my_mission: rope test -> TILT %.1f deg for %.1f s (thr %.0f%%), no transit",
-				 (double)_config.pitch_down_deg, (double)_config.tilt_hold,
-				 (double)(_config.fwd_thr * 100.f));
-
-		} else if (_config.fwd_dist > 0.f) {
+		// 拉绳测试**不走这条路** —— 它只从"手动起飞、飞出去、再切 Offboard"
+		// 进入（见 stateWait）。地面起飞的这一趟和有没有开绳无关，
+		// 开绳只是让 WAIT 那边允许手动进场。
+		if (_config.fwd_dist > 0.f) {
 			// ===========================================================
 			// 算"前方那一个点"
 			// ===========================================================
@@ -963,14 +955,9 @@ int MyMission::print_status()
 	_local_pos_sub.copy(&local_pos);
 	const matrix::Vector3f here(local_pos.x, local_pos.y, local_pos.z);
 
-	if (_config.rope_test) {
-		PX4_INFO("rope test ON: pitch_down %.1f deg, hold %.1f s, thr %.0f%%",
-			 (double)_config.pitch_down_deg, (double)_config.tilt_hold,
-			 (double)(_config.fwd_thr * 100.f));
-
-	} else {
-		PX4_INFO("rope test OFF (MYR_ROPE_EN = 0)");
-	}
+	PX4_INFO("rope pull: pitch_down %.1f deg, hold %.1f s, thr %.0f%% (entered when airborne)",
+		 (double)_config.pitch_down_deg, (double)_config.tilt_hold,
+		 (double)(_config.fwd_thr * 100.f));
 
 	// 接管安全：现在把模式开关拨出 Offboard 会不会掉高度？
 	manual_control_setpoint_s manual_control{};

@@ -54,7 +54,6 @@ struct MissionConfig {
 	float disarm_tmo{10.f};   ///< MYM_DISARM_TMO 上锁超时 [s]
 
 	// ---- MYR_*：系绳测试 ----
-	bool rope_test{false};       ///< MYR_ROPE_EN 拉绳测试开关；纯开关，不算几何
 	float pitch_down_deg{15.f};  ///< MYR_PITCH_DOWN 拉绳时的低头角 [deg]
 	float tilt_hold{10.f};       ///< MYR_TILT_HOLD 拉绳保持多久 [s]
 	float fwd_thr{0.f};         ///< MYR_FWD_THR 前推力电机归一化油门；> 0 时姿态钉在低头上限
