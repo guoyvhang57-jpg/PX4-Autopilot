@@ -287,12 +287,15 @@ MulticopterRateControl::Run()
 					// +9.7 deg in 0.5 s) was the stale part of the integral being dumped on the lift
 					// rotors in one step.
 					//
-					// 0.10 because that is below the pair's normal operating point: across eight
-					// logs the thruster mean throttle sits at 0.14 (median) with a 90th percentile of
-					// 0.24, so the whole integral is handed over for the entire cruise and the fade
-					// only happens in the last 0.4-0.5 s as the thrusters wind down.
-					static constexpr float kYawDiffFullU = 0.10f;
-					const float share = math::constrain(u_mean / kYawDiffFullU, 0.f, 1.f);
+					// 0.14 is the pair's median operating throttle across eight logs (90th percentile
+					// 0.24), so the whole integral is handed over for the entire cruise. Squared so
+					// the share falls away faster near the bottom: at 0.07 it is 0.25 instead of 0.50
+					// linear, i.e. the stale part of the integral is given back earlier, while the
+					// lift rotors still have time to absorb it instead of getting it all at once.
+					// Measured with the linear version: heading excursion per thruster stop 4.3 /
+					// 5.2 / 7.6 / 5.1 deg, against 7.2 / 11.0 / 11.9 deg all-or-nothing.
+					static constexpr float kYawDiffFullU = 0.14f;
+					const float share = math::constrain(sq(u_mean / kYawDiffFullU), 0.f, 1.f);
 
 					// Torque handed to the pair, limited to what it can actually deliver and scaled
 					// by its throttle share.
