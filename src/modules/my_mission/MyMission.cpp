@@ -322,26 +322,42 @@ bool MyMission::advanceTransit(const Tick &tick)
 
 	_transit_acc_xy = matrix::Vector2f(u.acceleration(0), u.acceleration(1)).norm();
 
-	// ---- 减速段判定 ----
-	// 沿航向的**有符号**加速度翻负并持续 0.2 s，就认为轨迹进入减速段。
-	// 单向闩锁：一段航程里减速之后不会再加速，所以没有退出条件，也就不会在零点抖。
-	// 闩锁之后 Run() 把前推力辅助关掉 —— 减速段姿态抬头，夹紧没有力可以交出去，
-	// 而减速过程中速度掉到参考以下时需求会短暂翻回低头，那一瞬间辅助会重新介入。
+	// ---- 辅助退出的时刻：控制器自己把前推力给成 0 之后 ----
+	// "明确不需要推力电机"只有一个可靠定义：**控制器算出来的缺额已经是零**。
+	// 缺额 = tan(需求) − tan(低头夹紧)，它乘 SC 之后就是 mc_pos_control 发出去的
+	// vehicle_attitude_setpoint.thrust_body[0]（PositionControl.cpp:372）。
+	// 所以直接读这个量：它连续 0.3 s 小于 2%（≈0.1 m/s²）就说明需求已经落回
+	// 夹紧以内，此时关辅助完全不可见 —— 夹紧本来就闲着，推力本来就是 0。
+	//
+	// 必须同时要求"轨迹在减速段"（沿航向前馈 < 0），否则一段温和的加速
+	// （需求角 5.8° < 15°，推力从头到尾都是 0）也会被误判成"可以关了"。
+	//
+	// 以前的两个判据为什么不行：
+	//   "沿航向前馈翻负"—— 那一刻飞机往往还落后 1~2 m/s，速度环还在拼命补
+	//     （实测总需求 +5.8 m/s² = 31°），关辅助等于把 15° 夹紧一起撤掉，
+	//     姿态从 15° 跳到 31°；
+	//   "速度追上轨迹"—— 只让 P 项归零，积分里还压着 3~4 m/s² 的阻力补偿，
+	//     需求依然高于夹紧，还是会跳。
 	{
 		const matrix::Vector2f acc_xy(u.acceleration(0), u.acceleration(1));
 		_transit_acc_along = acc_xy.dot(_transit_dir);
 
-		if (!_decel_latched && (_transit_acc_along < -0.2f)) {
-			_decel_timer += tick.dt;
+		vehicle_attitude_setpoint_s att_sp{};
+		const float thr_cmd = _att_sp_sub.copy(&att_sp) ? fabsf(att_sp.thrust_body[0]) : 0.f;
 
-			if (_decel_timer > 0.2f) {
-				_decel_latched = true;
-				PX4_INFO("my_mission: deceleration phase (a_along %.2f m/s^2), forward assist off",
-					 (double)_transit_acc_along);
+		if (!_decel_latched) {
+			if ((_transit_acc_along < -0.2f) && (thr_cmd < 0.02f)) {
+				_decel_timer += tick.dt;
+
+				if (_decel_timer > 0.3f) {
+					_decel_latched = true;
+					PX4_INFO("my_mission: forward thrust already 0 (%.3f) in the decel, assist latched off",
+						 (double)thr_cmd);
+				}
+
+			} else {
+				_decel_timer = 0.f;   // 推力又上来了，重新计时
 			}
-
-		} else if (_transit_acc_along >= -0.2f) {
-			_decel_timer = 0.f;
 		}
 	}
 
@@ -464,10 +480,16 @@ void MyMission::Run()
 	// 每拍都发（含 WAIT/DONE）：控制器用 500 ms 超时判活，断流按"禁止"处理。
 	// 只在"需要往前加速"的时候开：
 	//   TILT     —— 整个拉绳段都要，这是它存在的意义
-	//   FORWARD  —— 加速段和巡航段要，**减速段关掉**（姿态抬头，没有力要交出去）
-	//   其余     —— RETURN 是空载回家，HOVER/LAND 更不需要，一律关
-	const bool assist_allowed = (_state == State::Tilt)
-				    || ((_state == State::Forward) && !_decel_latched);
+	//   FORWARD  —— 加速段和巡航段要
+	//   RETURN   —— 同样是长距离前飞（20 m/s 需要它），一样按减速段关
+	//   其余     —— TAKEOFF/HOVER/LAND 不需要，一律关
+	//
+	// 减速段的闩锁每个状态各自一份（enterState 会清），所以去程和回程互不影响。
+	// 关的时刻由 advanceTransit() 判：控制器自己把前推力给成 0 之后才关，
+	// 保证关的时候推力本来就没了，姿态不会跳。
+	const bool transit_assist = ((_state == State::Forward) || (_state == State::Return))
+				    && !_decel_latched;
+	const bool assist_allowed = (_state == State::Tilt) || transit_assist;
 	_output.publishAssist(assist_allowed, now);
 
 	// ---- 2) 安全兜底 ----

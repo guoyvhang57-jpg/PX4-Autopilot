@@ -59,6 +59,7 @@
 #include <uORB/Subscription.hpp>
 #include <uORB/topics/actuator_armed.h>
 #include <uORB/topics/vehicle_angular_velocity.h>
+#include <uORB/topics/vehicle_attitude_setpoint.h>
 #include <uORB/topics/home_position.h>
 #include <uORB/topics/manual_control_setpoint.h>
 #include <uORB/topics/parameter_update.h>
@@ -249,6 +250,7 @@ private:
 	uORB::Subscription _land_detected_sub{ORB_ID(vehicle_land_detected)}; // landed 判据
 	uORB::Subscription _home_position_sub{ORB_ID(home_position)};      // 解锁时设的 home，判断手动进场用
 	uORB::Subscription _angular_velocity_sub{ORB_ID(vehicle_angular_velocity)}; // RETURN 掉头判据用
+	uORB::Subscription _att_sp_sub{ORB_ID(vehicle_attitude_setpoint)};       // 读控制器给的前推力，判辅助何时可以关
 	uORB::Subscription _manual_control_sub{ORB_ID(manual_control_setpoint)}; // 接管安全：油门杆位置
 
 	// 参数默认值/含义见 my_mission_params.yaml；改完不用重启模块（Run 里 updateParams）

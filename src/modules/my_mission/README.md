@@ -262,12 +262,17 @@ MYR_FWD_THR > 0  ->  a = g * ( tan(上限) + MYR_FWD_THR / SC )    姿态 = 上�
 | ③ | 阶段许可 | 本模块每拍发的 `my_mission_assist.enabled` |
 | ④ | 需求角 > `MYM_PITCH_MIN` | `PositionControl` 算缺额，> 0 才有推力 |
 
-③ 只在两个阶段为真：
+③ 只在三个阶段为真：
 
 - `TILT`（拉绳段）—— 整段
-- `FORWARD` 的加速段和巡航段 —— 沿航向加速度翻负并持续 0.2 s 后闩锁，本段余下时间关掉
+- `FORWARD`（去程）—— 直到本段的减速段闩锁
+- `RETURN`（回程）—— 同样是长距离前飞，规则相同
 
-其余状态（`TAKEOFF` / `HOVER` / `RETURN` / `LAND` / `DISARM` / `DONE` / `WAIT`）一律为假。
+其余状态（`TAKEOFF` / `HOVER` / `LAND` / `DISARM` / `DONE` / `WAIT`）一律为假。
+
+**关的时刻**：控制器自己把前推力给成 0（`vehicle_attitude_setpoint.thrust_body[0] < 2%`）
+**并且**轨迹已进入减速段（沿航向前馈 < −0.2），连续 0.3 s 才单向闩锁。这时缺额本来就是 0，
+关掉辅助只是把闲置的夹紧放开，姿态不会跳。每段航程各有一份闩锁，`enterState` 清零。
 
 **超时按"禁止"处理（fail-closed）。** 控制器 500 ms 收不到 `my_mission_assist` 就认为
 辅助关闭。代价是这条路变成 `my_mission` 专用：用 MAVSDK / ROS 2 飞 Offboard 时拿不到
