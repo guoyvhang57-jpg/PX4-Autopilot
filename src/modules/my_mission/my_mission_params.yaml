@@ -181,6 +181,27 @@ parameters:
       min: 0.1
       max: 3.0
       unit: m/s
+    MYM_ALT_HIGH:
+      description:
+        short: 起飞后要爬到的任务高度
+        long: |-
+          起飞先到 MYM_ALT，然后**在去往前飞点的同时斜着爬到**这个高度，之后一直保持。
+          0 = 不额外爬升（任务高度就是 MYM_ALT）。
+
+          "斜着爬"是位置平滑器生成的：前飞段的终点同时给了 x/y 和 z，它就规划一条
+          爬升+前进的合成轨迹，不用先垂直爬到顶再平飞。爬升率和加速度分别受
+          MPC_Z_V_AUTO_UP / MPC_ACC_UP_MAX 限制。
+
+          没有配前飞距离（MYM_FWD_DIST = 0）时没有水平分量，退化成原地垂直爬升，
+          由位置环按 MPC_Z_V_AUTO_UP 慢慢爬。
+
+          拉绳测试（离地后切 Offboard）那条路**不受影响**：它直接用飞手当时的高度。
+      type: float
+      default: 0.0
+      decimal: 1
+      min: 0.0
+      max: 100.0
+      unit: m
     MYM_ARRIVE:
       description:
         short: 到达目标点的判定半径

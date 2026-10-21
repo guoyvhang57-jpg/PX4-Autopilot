@@ -256,6 +256,7 @@ private:
 	// 参数默认值/含义见 my_mission_params.yaml；改完不用重启模块（Run 里 updateParams）
 	DEFINE_PARAMETERS(
 		(ParamFloat<px4::params::MYM_ALT>) _param_mym_alt,
+		(ParamFloat<px4::params::MYM_ALT_HIGH>) _param_mym_alt_high,
 		(ParamFloat<px4::params::MYM_FWD_DIST>) _param_mym_fwd_dist,
 		(ParamFloat<px4::params::MYM_FWD_DIR>) _param_mym_fwd_dir,
 		(ParamFloat<px4::params::MYM_FWD_SPD>) _param_mym_fwd_spd,

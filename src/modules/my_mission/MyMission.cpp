@@ -163,6 +163,7 @@ MissionOutput::Setpoint MyMission::targetSetpoint() const
 void MyMission::refreshConfig()
 {
 	_config.alt = _param_mym_alt.get();
+	_config.alt_high = _param_mym_alt_high.get();
 	_config.fwd_dist = _param_mym_fwd_dist.get();
 	_config.fwd_dir_deg = _param_mym_fwd_dir.get();
 	_config.fwd_spd = _param_mym_fwd_spd.get();
@@ -673,15 +674,36 @@ void MyMission::stateTakeoff(const Tick &tick)
 			// 现在 _target 留在起飞点，由 FORWARD 状态每拍推一点点过去。
 			_goal3(0) = _target(0) + _config.fwd_dist * cosf(psi);
 			_goal3(1) = _target(1) + _config.fwd_dist * sinf(psi);
-			_goal3(2) = _target(2);   // z 不动：先在 MYM_ALT 上平飞过去
+
+			// 任务高度：MYM_ALT_HIGH 给了就爬到它（必须比 MYM_ALT 高，否则忽略）。
+			// 因为这里同时给了 z，平滑器会生成一条**斜着爬升**的轨迹 —— 前飞和
+			// 爬升一次做完，不用先垂直爬再平飞。
+			const float alt_mission = math::max(_config.alt, _config.alt_high);
+			_goal3(2) = _ground_z - alt_mission;
+
+			if (alt_mission > _config.alt + 0.01f) {
+				PX4_INFO("my_mission: climbing to %.2f m on the way out (MYM_ALT_HIGH)", (double)alt_mission);
+			}
 
 			enterTransit(tick, State::Forward);
 			logTransitStart(tick);
 
 		} else {
-			// 既没开绳、MYM_FWD_DIST 也是 0：没有目的地，悬停 MYM_HOVER 秒后降落。
+			// 既没开绳、MYM_FWD_DIST 也是 0：没有目的地。
+			// 但有 MYM_ALT_HIGH 时要先爬上去 —— 没有水平分量，所以是垂直爬升，
+			// 由位置环按 MPC_Z_V_AUTO_UP 慢慢爬，HOVER 期间保持这个高度。
+			const float alt_mission = math::max(_config.alt, _config.alt_high);
+
+			if (alt_mission > _config.alt + 0.01f) {
+				_target(2) = _ground_z - alt_mission;
+				PX4_INFO("my_mission: climbing in place to %.2f m (MYM_ALT_HIGH), then HOVER %.1f s",
+					 (double)alt_mission, (double)_config.hover);
+
+			} else {
+				PX4_INFO("my_mission: HOVER %.1f s", (double)_config.hover);
+			}
+
 			enterState(State::Hover, tick.now);
-			PX4_INFO("my_mission: HOVER %.1f s", (double)_config.hover);
 		}
 
 	} else if (elapsedSince(_state_start, tick.now) > _config.tko_tmo) {

@@ -50,6 +50,7 @@ WAIT ──手势解锁 + 进 Offboard──>
 |---|---|
 | `TAKEOFF` 起飞点 | home 的 x/y |
 | `TAKEOFF` 目标高度 | `home.z − MYM_ALT`（`home.z` 就是那块地的地面） |
+| 前飞段高度 | `home.z − max(MYM_ALT, MYM_ALT_HIGH)`，斜着爬 |
 | `FORWARD` 终点 | home 的 x/y + `MYM_FWD_DIST` |
 | 手动进场判据 | 到 home 的三维距离 |
 | `RETURN` 目标 | home 的 x/y + 当前高度 |
@@ -162,6 +163,7 @@ WAIT ──手势解锁 + 进 Offboard──>
 | `MYM_HOVER` | 5.0 s | 到达**前方点**后的悬停时间（绳开时用 `MYR_TILT_HOLD`，不用这个） |
 | `MYM_LAND_MODE` | 1 | 0 = Offboard 下降，1 = PX4 AUTO_LAND |
 | `MYM_DESC_RATE` | 0.4 m/s | Offboard 下降速率（仅 mode 0）。**会被强制抬到 ≥ `1.1 × LNDMC_Z_VEL_MAX`（0.275 m/s）**，否则 land detector 判不出"被指令下降"，`landed` 永远上不去 → 上不了锁 |
+| `MYM_ALT_HIGH` | 0.0 m | 起飞后要爬到的高度（0 = 不额外爬升）；前飞时斜着爬 |
 | `MYM_ARRIVE` | 0.20 m | 到位判定半径（同时要求速度 < 0.3 m/s） |
 | `MYM_TKO_TMO` | 20 s | 起飞超时 → 直接转降落 |
 | `MYM_LAND_TMO` | 40 s | 降落超时 → 转去上锁 |

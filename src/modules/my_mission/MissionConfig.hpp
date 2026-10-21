@@ -39,6 +39,7 @@
 struct MissionConfig {
 	// ---- MYM_*：任务流程 ----
 	float alt{1.5f};          ///< MYM_ALT 起飞目标高度 [m]
+	float alt_high{0.f};      ///< MYM_ALT_HIGH 起飞后要爬到的任务高度 [m]，0 = 不额外爬升
 	float fwd_dist{3.f};      ///< MYM_FWD_DIST 前飞距离 [m]，0 = 跳过 FORWARD
 	float fwd_dir_deg{0.f};   ///< MYM_FWD_DIR 前飞方向相对机头的偏角 [deg]
 	float fwd_spd{0.5f};      ///< MYM_FWD_SPD 中转巡航速度 [m/s]
