@@ -432,6 +432,28 @@ ControlAllocator::Run()
 
 			// Do allocation
 			_control_allocation[i]->allocate();
+
+			// External per-motor trim, applied before the auxiliary controls and the clip so that it
+			// obeys the same actuator limits and slew rate as everything else. Needed because some
+			// actuators are deliberately kept out of the effectiveness matrix, which puts their
+			// differential in the null space of the allocation where no control setpoint can reach it.
+			if (i == 0) {
+				actuator_motors_trim_s motors_trim{};
+
+				// ignore a stale trim rather than holding the last one forever
+				if (_actuator_motors_trim_sub.copy(&motors_trim) && hrt_elapsed_time(&motors_trim.timestamp) < 100_ms) {
+					int num_motors = _num_actuators[0];
+
+					if (num_motors > (int)actuator_motors_s::NUM_CONTROLS) {
+						num_motors = actuator_motors_s::NUM_CONTROLS;
+					}
+
+					for (int act = 0; act < num_motors; act++) {
+						_control_allocation[i]->_actuator_sp(act) += motors_trim.trim[act];
+					}
+				}
+			}
+
 			_actuator_effectiveness->allocateAuxilaryControls(dt, i, _control_allocation[i]->_actuator_sp); //flaps and spoilers
 			_actuator_effectiveness->updateSetpoint(c[i], i, _control_allocation[i]->_actuator_sp,
 								_control_allocation[i]->getActuatorMin(), _control_allocation[i]->getActuatorMax());

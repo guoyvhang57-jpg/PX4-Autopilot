@@ -71,6 +71,7 @@
 #include <uORB/Subscription.hpp>
 #include <uORB/SubscriptionCallback.hpp>
 #include <uORB/topics/actuator_motors.h>
+#include <uORB/topics/actuator_motors_trim.h>
 #include <uORB/topics/actuator_servos.h>
 #include <uORB/topics/actuator_servos_trim.h>
 #include <uORB/topics/control_allocator_status.h>
@@ -199,6 +200,12 @@ private:
 
 	uORB::Subscription _vehicle_torque_setpoint1_sub{ORB_ID(vehicle_torque_setpoint), 1};  /**< vehicle torque setpoint subscription (2. instance) */
 	uORB::Subscription _vehicle_thrust_setpoint1_sub{ORB_ID(vehicle_thrust_setpoint), 1};	 /**< vehicle thrust setpoint subscription (2. instance) */
+
+	// Normalised per-motor trim added straight to the allocated motor outputs. This exists because
+	// some actuators are deliberately left out of the effectiveness matrix (a thruster pair whose
+	// yaw lever arm is not modelled, for instance) and therefore cannot be reached by any control
+	// setpoint: their differential sits in the null space of the allocation.
+	uORB::Subscription _actuator_motors_trim_sub{ORB_ID(actuator_motors_trim)};
 
 	// Outputs
 	uORB::PublicationMulti<control_allocator_status_s> _control_allocator_status_pub[2] {ORB_ID(control_allocator_status), ORB_ID(control_allocator_status)};

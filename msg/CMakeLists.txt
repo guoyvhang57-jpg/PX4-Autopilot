@@ -40,6 +40,7 @@ set(msg_files
 	ActionRequest.msg
 	ActuatorArmed.msg
 	ActuatorControlsStatus.msg
+	ActuatorMotorsTrim.msg
 	ActuatorOutputs.msg
 	ActuatorServosTrim.msg
 	ActuatorTest.msg

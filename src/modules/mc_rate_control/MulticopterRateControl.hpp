@@ -48,6 +48,8 @@
 #include <uORB/Subscription.hpp>
 #include <uORB/SubscriptionCallback.hpp>
 #include <uORB/topics/actuator_controls_status.h>
+#include <uORB/topics/actuator_motors.h>
+#include <uORB/topics/actuator_motors_trim.h>
 #include <uORB/topics/battery_status.h>
 #include <uORB/topics/control_allocator_status.h>
 #include <uORB/topics/manual_control_setpoint.h>
@@ -101,12 +103,15 @@ private:
 	uORB::Subscription _vehicle_land_detected_sub{ORB_ID(vehicle_land_detected)};
 	uORB::Subscription _vehicle_rates_setpoint_sub{ORB_ID(vehicle_rates_setpoint)};
 	uORB::Subscription _vehicle_status_sub{ORB_ID(vehicle_status)};
+	// Read back so the yaw split can size the differential against what the thruster pair is actually doing
+	uORB::Subscription _actuator_motors_sub{ORB_ID(actuator_motors)};
 
 	uORB::SubscriptionInterval _parameter_update_sub{ORB_ID(parameter_update), 1_s};
 
 	uORB::SubscriptionCallbackWorkItem _vehicle_angular_velocity_sub{this, ORB_ID(vehicle_angular_velocity)};
 
 	uORB::Publication<actuator_controls_status_s>	_actuator_controls_status_pub{ORB_ID(actuator_controls_status_0)};
+	uORB::Publication<actuator_motors_trim_s>	_actuator_motors_trim_pub{ORB_ID(actuator_motors_trim)};
 	uORB::PublicationMulti<rate_ctrl_status_s>	_controller_status_pub{ORB_ID(rate_ctrl_status)};
 	uORB::Publication<vehicle_rates_setpoint_s>	_vehicle_rates_setpoint_pub{ORB_ID(vehicle_rates_setpoint)};
 	uORB::Publication<vehicle_thrust_setpoint_s>	_vehicle_thrust_setpoint_pub;
@@ -156,6 +161,12 @@ private:
 		(ParamFloat<px4::params::MC_YAWRATE_FF>) _param_mc_yawrate_ff,
 		(ParamFloat<px4::params::MC_YAWRATE_K>) _param_mc_yawrate_k,
 		(ParamFloat<px4::params::MC_YAW_TQ_CUTOFF>) _param_mc_yaw_tq_cutoff,
+
+		// Yaw authority split: hand the yaw integrator to a symmetric thruster pair and keep the rest
+		// (P, D, feedforward and whatever the pair cannot absorb) on the lift rotors.
+		(ParamFloat<px4::params::MC_YAW_DIFF_GAIN>) _param_mc_yaw_diff_gain,
+		(ParamInt<px4::params::MC_YAW_DIFF_ACT1>) _param_mc_yaw_diff_act1,
+		(ParamInt<px4::params::MC_YAW_DIFF_ACT2>) _param_mc_yaw_diff_act2,
 
 		(ParamFloat<px4::params::MC_ACRO_R_MAX>) _param_mc_acro_r_max,
 		(ParamFloat<px4::params::MC_ACRO_P_MAX>) _param_mc_acro_p_max,

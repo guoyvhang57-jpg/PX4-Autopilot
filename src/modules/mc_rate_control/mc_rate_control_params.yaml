@@ -236,3 +236,76 @@ parameters:
       max: 10
       unit: Hz
       decimal: 3
+    MC_YAW_DIFF_GAIN:
+      description:
+        short: Yaw differential per unit of yaw integrator
+        long: |-
+          Routes the yaw integrator to a symmetric thruster pair instead of the lift rotors. Set to
+          0 to disable; the yaw loop is then entirely on the lift rotors, as without this feature.
+
+          The pair is driven differentially through actuator_motors_trim, because the allocator is
+          deliberately kept blind to its yaw lever arm (CA_ROTORn_PY = 0) and therefore cannot reach
+          the differential through any torque setpoint. Exactly the amount handed over is subtracted
+          from the torque sent to the allocator, so the two paths always sum to the demand: when the
+          pair has no headroom (thrusters off or saturated) everything stays on the lift rotors, and
+          the transition is continuous with throttle rather than a switch.
+
+          The value is a unit conversion, not a tuning gain, but it is defined at 50% throttle:
+
+            gain = 1 / (2 * PY * AX * CT)
+
+          with PY the REAL lever arm, AX the thrust-axis body-x component and CT the rotor thrust
+          coefficient. For a 0.55 m lever arm and 20 deg of thrust-axis tilt with CT = 21.6 N,
+          2 * 0.55 * 0.940 * 21.6 = 22.3 N*m per unit, so gain = 0.045.
+
+          The 50% is not arbitrary and the conversion is not constant. With THR_MDL_FAC the actuator
+          command is a normalised rotor speed, so thrust goes as u^2 and the yaw torque per unit of
+          differential is its derivative, 4 * PY * AX * CT * u: 8.5 N*m/unit at 19% throttle, 22.3 at
+          50%, 44.7 at 100%. The implementation scales this gain by 0.5/u_mean, so the value to enter
+          here is always the 50% figure and the throttle dependence is handled for you.
+
+          Getting that wrong is not subtle: a constant gain flown at 19% throttle delivered only 38%
+          of the torque it removed and the yaw integrator grew 2.6x to cover the hole.
+
+          PY in that formula is the real geometry, NOT CA_ROTORn_PY. CA_ROTORn_PY must stay 0, and
+          that is the whole reason this path exists: telling the allocator about the lever arm would
+          make it take the yaw channel over (the pair is ~20x more yaw-effective than the lift
+          rotors) and smear the slipstream, so instead the allocator is kept blind and the steady
+          part of the yaw demand comes through the motor trim, which bypasses the allocation and
+          therefore only depends on the real geometry.
+
+          Consequence: this gain is the only place the real lever arm is written down. Changing the
+          airframe geometry means recomputing it, and CA_ROTORn_PY is not going to remind you.
+
+          Do not set CA_ROTORn_PY non-zero while this is enabled. The allocator and this path would
+          then both drive the differential and the yaw loop gain would be wrong.
+
+          The formula also assumes CA_ROTORn_CT is in newtons, i.e. that one unit of normalised yaw
+          torque is one N*m. If the airframe uses normalised CT values instead, the allocator's yaw
+          scale changes and this gain has to be divided by it.
+      type: float
+      default: 0.0
+      min: 0.0
+      max: 1.0
+      decimal: 4
+      increment: 0.001
+    MC_YAW_DIFF_ACT1:
+      description:
+        short: Actuator index driven up by the yaw differential
+        long: |-
+          One of the two actuators of the symmetric thruster pair. Only used when MC_YAW_DIFF_GAIN is
+          non-zero, and only in Offboard, matching the forward-thrust assist it exists to complement.
+      type: int32
+      default: 4
+      min: 0
+      max: 11
+    MC_YAW_DIFF_ACT2:
+      description:
+        short: Actuator index driven down by the yaw differential
+        long: |-
+          The other actuator of the pair. Must differ from MC_YAW_DIFF_ACT1; the two are driven by
+          equal and opposite amounts so the collective thrust is unaffected.
+      type: int32
+      default: 5
+      min: 0
+      max: 11

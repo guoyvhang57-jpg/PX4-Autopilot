@@ -225,6 +225,96 @@ MulticopterRateControl::Run()
 			// publish rate controller status
 			rate_ctrl_status_s rate_ctrl_status{};
 			_rate_control.getRateControlStatus(rate_ctrl_status);
+
+			// Yaw authority split. The allocator is deliberately blind to the thrusters' yaw lever arm
+			// (CA_ROTORn_PY = 0), which puts their differential in the null space of the allocation:
+			// no torque setpoint can reach it. Route the yaw integrator there through the motor trim
+			// topic and subtract exactly what is handed over, so the two contributions always sum to
+			// the demand.
+			//
+			// The pair can only absorb what its headroom allows, and whatever does not fit stays with
+			// the lift rotors. That makes the split continuous in throttle and degrades to the
+			// unmodified behaviour when the thrusters are off or saturated, so there is no switching
+			// point to get wrong.
+			actuator_motors_trim_s motors_trim{};
+			const float yaw_diff_gain = _param_mc_yaw_diff_gain.get();
+
+			if (yaw_diff_gain > FLT_EPSILON && _vehicle_control_mode.flag_control_offboard_enabled) {
+				const int act1 = _param_mc_yaw_diff_act1.get();
+				const int act2 = _param_mc_yaw_diff_act2.get();
+				actuator_motors_s motors{};
+
+				if (act1 >= 0 && act1 < static_cast<int>(actuator_motors_s::NUM_CONTROLS)
+				    && act2 >= 0 && act2 < static_cast<int>(actuator_motors_s::NUM_CONTROLS)
+				    && act1 != act2
+				    && _actuator_motors_sub.copy(&motors)) {
+
+					// Headroom of the pair in actuator units. Use the pair's mean rather than the raw
+					// readback: the readback already contains last cycle's trim, so min(u1, 1-u2) would
+					// subtract the differential from its own headroom and oscillate -- measured 0.30
+					// against 0.20 every cycle at f = 0.5 for a 0.30 demand. The trim is equal and
+					// opposite, so the mean is the untrimmed operating point.
+					const float u_mean = 0.5f * (motors.control[act1] + motors.control[act2]);
+
+					// The conversion is not constant. With THR_MDL_FAC the actuator command is a
+					// normalised rotor speed, so thrust goes as u^2 and the yaw torque per unit of
+					// differential is the derivative of that:
+					//
+					//   d(tau)/d(diff) = 4 * PY * AX * CT * u_mean
+					//
+					// i.e. 44.7 * u_mean here: 8.5 N*m/unit at 19% throttle, 22.3 at 50%, 44.7 at
+					// 100%. MC_YAW_DIFF_GAIN is defined at u_mean = 0.5, so scale it by 0.5/u_mean.
+					//
+					// Getting this wrong is not subtle: flying at 19% throttle with a constant gain
+					// delivered only 38% of the torque it removed, and the yaw integrator grew 2.6x to
+					// cover the hole (measured 0.046 -> 0.111 and still climbing, against 0.121
+					// predicted). The floor keeps the divide finite when the thrusters are off, where
+					// the headroom is zero anyway and nothing is handed over.
+					const float gain_eff = yaw_diff_gain / math::max(2.f * u_mean, 0.02f);
+
+					const float headroom = math::max(0.f, math::min(u_mean, 1.f - u_mean));
+					const float max_torque = headroom / gain_eff;
+
+					// Share handed to the pair, as a proportion of its throttle. This is what makes
+					// the transfer gradual in BOTH directions without a slew limiter: the thrusters
+					// ramp up, the share ramps up; they ramp down and it ramps back, and whatever
+					// fraction is not handed over stays with the lift rotors, whose integrator then
+					// absorbs the difference on its own.
+					//
+					// Full transfer from kYawDiffFullU upwards. Below it the share falls linearly to
+					// zero, so by the time the pair is too slow to deliver anything there is nothing
+					// left to hand back -- the abrupt kick measured at the end of a leg (heading
+					// +9.7 deg in 0.5 s) was the stale part of the integral being dumped on the lift
+					// rotors in one step.
+					//
+					// 0.10 because that is below the pair's normal operating point: across eight
+					// logs the thruster mean throttle sits at 0.14 (median) with a 90th percentile of
+					// 0.24, so the whole integral is handed over for the entire cruise and the fade
+					// only happens in the last 0.4-0.5 s as the thrusters wind down.
+					static constexpr float kYawDiffFullU = 0.10f;
+					const float share = math::constrain(u_mean / kYawDiffFullU, 0.f, 1.f);
+
+					// Torque handed to the pair, limited to what it can actually deliver and scaled
+					// by its throttle share.
+					const float yaw_torque = math::constrain(rate_ctrl_status.yawspeed_integ,
+								 -max_torque, max_torque) * share;
+					const float diff = yaw_torque * gain_eff;
+
+					torque_setpoint(2) -= yaw_torque;
+
+					// A positive yaw torque (nose right in FRD) comes from raising the thruster on the
+					// left and lowering the one on the right, i.e. act2 up and act1 down, because the
+					// pair sits at -PY and +PY respectively. If the assist fights the disturbance
+					// instead of cancelling it, swap MC_YAW_DIFF_ACT1 and MC_YAW_DIFF_ACT2.
+					motors_trim.trim[act1] = -diff;
+					motors_trim.trim[act2] = diff;
+				}
+			}
+
+			// publish every cycle, even when disabled, so a stale trim cannot linger in the allocator
+			motors_trim.timestamp = hrt_absolute_time();
+			_actuator_motors_trim_pub.publish(motors_trim);
+
 			rate_ctrl_status.timestamp = hrt_absolute_time();
 			_controller_status_pub.publish(rate_ctrl_status);
 
