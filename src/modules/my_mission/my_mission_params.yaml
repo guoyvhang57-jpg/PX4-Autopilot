@@ -79,6 +79,47 @@ parameters:
       min: 0.1
       max: 8.0
       unit: m/s^2
+    MYM_FWD_JERK_MAX:
+      description:
+        short: 远离低头限幅时的 jerk 上限
+        long: |-
+          中转段轨迹的加加速度上限，单位 m/s^3。需求俯仰角**离低头限幅还远**时用这个值。
+
+          轨迹里的 jerk 只会取"正这个值、零、负这个值"，所以它直接决定姿态的变化率：
+          俯仰角速率约等于 **5.84 x jerk** 度每秒（jerk = 4 -> 约 23 度/秒）。
+          从平飞到加速度平台（平台角 = atan(MYM_FWD_ACC / 9.81)）需要
+          MYM_FWD_ACC / jerk 秒。
+
+          需求角接近限幅（默认从限幅的 80% 起）时按比例往 MYM_FWD_JERK_MIN 降，
+          见那个参数。
+      type: float
+      default: 4.0
+      decimal: 1
+      min: 0.1
+      max: 50.0
+      unit: m/s^3
+    MYM_FWD_JERK_MIN:
+      description:
+        short: 贴着低头限幅时的 jerk
+        long: |-
+          需求俯仰角逼近低头限幅（min(|MYM_PITCH_MIN|, MPC_TILTMAX_AIR)，默认 15 度）时
+          用的 jerk，单位 m/s^3。
+
+          调度是线性的：需求角在限幅的 **80% 以下用 MYM_FWD_JERK_MAX**，
+          80% -> 100% 之间按比例插到本参数。作用是把"姿态到限幅、前推力接手"
+          这个交接过得柔和一些 —— 姿态和缺额出来的推力都来自同一个加速度需求，
+          全速撞到边界会让两者同时阶跃。
+
+          jetk 越小、需求角爬得越慢，所以它决定"需求角能不能穿过限幅"：
+          一段航程的峰值加速度约 sqrt(jerk x 峰值速度)，只有它超过
+          g x tan(限幅) = 2.63 m/s^2 时，前推力辅助才会真正出力。
+          6 m/s 的巡航配上 1.0 只有 2.45 m/s^2 —— 辅助永远不会触发，这不是 bug。
+      type: float
+      default: 1.0
+      decimal: 1
+      min: 0.1
+      max: 50.0
+      unit: m/s^3
     MYM_FWD_TMO:
       description:
         short: FORWARD 段超时

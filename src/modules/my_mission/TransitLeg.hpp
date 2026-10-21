@@ -42,6 +42,7 @@
 #pragma once
 
 #include <lib/motion_planning/PositionSmoothing.hpp>
+#include <mathlib/mathlib.h>
 #include <matrix/matrix/math.hpp>
 
 #include <uORB/topics/vehicle_local_position.h>
@@ -59,7 +60,7 @@ public:
 		float cruise_speed{0.5f};   ///< 速度规划上限（MYM_FWD_SPD）
 		float accel_xy{1.f};        ///< 水平加减速上限（MYM_FWD_ACC）
 		float vel_xy_max{12.f};     ///< 水平速度硬上限（MPC_XY_VEL_MAX）
-		float jerk{4.f};            ///< MPC_JERK_AUTO
+		float jerk{4.f};            ///< 进中转那一刻的 jerk（运行时由 setJerk 调度）
 		float err_max_xy{2.f};      ///< MPC_XY_ERR_MAX
 		float err_max_z{1.f};       ///< MPC_Z_ERR_MAX
 		float vel_z_max{3.f};       ///< MPC_Z_V_AUTO_UP
@@ -82,6 +83,15 @@ public:
 	~TransitLeg() = default;
 
 	void setLimits(const Limits &limits);
+
+	/**
+	 * @brief 只改 jerk 上限，其余限制不动
+	 *
+	 * 给"按需求姿态调度 jerk"用：离低头限幅远时给大值、贴着限幅时给小值。
+	 * 平滑器每拍都用这个值重规划，所以中途改是安全的 —— 走过的状态不动，
+	 * 只改"从现在开始还能怎么变"，加速度连续，改的只是斜率。
+	 */
+	void setJerk(float jerk) { _smoothing.setMaxJerk(math::max(jerk, 0.1f)); }
 
 	/**
 	 * @brief 从飞机的当前三阶状态点亮平滑器，开始一段新航程

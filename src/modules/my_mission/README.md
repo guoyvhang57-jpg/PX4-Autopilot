@@ -89,6 +89,12 @@ WAIT ──手势解锁 + 进 Offboard──>
     - 到位判据 = **轨迹**贴住终点（`MYM_ARRIVE`）**且飞机**速度 < 0.3 m/s。
     - 超时 `MYM_FWD_TMO` → 直接转 `LAND`（和起飞超时同样的策略：不硬追）。
 - `HOVER`：保持同一 setpoint `MYM_HOVER` 秒。
+- **jerk 按需求姿态调度**：需求角离低头限幅远时用 `MYM_FWD_JERK_MAX`，
+  从限幅的 80% 起线性降到 `MYM_FWD_JERK_MIN`。作用是把"姿态到限幅、前推力接手"
+  这个交接过得柔和些——姿态和缺额出来的推力来自同一个加速度需求，全速撞边界
+  会让两者同时阶跃。需求角取自上一拍发出的前馈（20 ms 前），不构成闭环。
+  约束：一段航程的峰值加速度约 `sqrt(jerk × 峰值速度)`，只有超过
+  `g·tan(限幅) = 2.63 m/s²` 时前推力才会触发。
 - `TILT`（`MYR_ROPE_EN = 1` 才进）：目标留在起飞点上空，按 `MYR_PITCH_DOWN` /
   `MYR_FWD_THR` 发一条沿起飞航向的加速度前馈，**高度不变**，保持 `MYR_TILT_HOLD` 秒。
 - `LAND`：`MYM_LAND_MODE=1` 发 `MAV_CMD_NAV_LAND` 交给 PX4 AUTO_LAND；`=0` 则纯 Offboard 把 z 以
@@ -128,6 +134,8 @@ WAIT ──手势解锁 + 进 Offboard──>
 | `MYM_FWD_DIR` | 0.0 deg | 前飞方向相对起飞航向的偏角：0 = 正前，+90 = 右，-90 = 左，180 = 后 |
 | `MYM_FWD_SPD` | 0.5 m/s | 前飞巡航速度（对地）。位置目标是按这个速度**推**过去的，不是一步跳过去 |
 | `MYM_FWD_ACC` | 1.0 m/s² | 前飞加/减速上限。**决定姿态变化大小**：平飞倾角 ≈ `atan(加速度/9.81)`，1.0 → ≈6° |
+| `MYM_FWD_JERK_MAX` | 4.0 m/s³ | 远离限幅时的 jerk；≈5.84×值 度/秒 |
+| `MYM_FWD_JERK_MIN` | 1.0 m/s³ | 贴着限幅时的 jerk |
 | `MYM_FWD_TMO` | 20 s | 前飞超时 → 直接转降落。斜坡比阶跃慢，改小 `MYM_FWD_SPD` 时要一起放大 |
 | `MYM_HOVER` | 5.0 s | 到达**前方点**后的悬停时间（绳开时用 `MYR_TILT_HOLD`，不用这个） |
 | `MYM_LAND_MODE` | 1 | 0 = Offboard 下降，1 = PX4 AUTO_LAND |

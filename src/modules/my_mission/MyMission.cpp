@@ -157,6 +157,8 @@ void MyMission::refreshConfig()
 	_config.fwd_dir_deg = _param_mym_fwd_dir.get();
 	_config.fwd_spd = _param_mym_fwd_spd.get();
 	_config.fwd_acc = _param_mym_fwd_acc.get();
+	_config.fwd_jerk_max = _param_mym_fwd_jerk_max.get();
+	_config.fwd_jerk_min = _param_mym_fwd_jerk_min.get();
 	_config.fwd_tmo = _param_mym_fwd_tmo.get();
 	_config.hover = _param_mym_hover.get();
 	_config.land_mode = _param_mym_land_mode.get();
@@ -182,7 +184,10 @@ TransitLeg::Limits MyMission::transitLimits() const
 	limits.cruise_speed = _config.fwd_spd;
 	limits.accel_xy = _config.fwd_acc;
 	limits.vel_xy_max = _external.mpcXyVelMax();
-	limits.jerk = _external.mpcJerkAuto();
+	// 这里给的是"进中转那一刻"的 jerk（离限幅远的大值）。真正每拍用多少由
+	// advanceTransit() 里的 scheduledJerk() 下发：按需求姿态离低头限幅的比例
+	// 在 MYM_FWD_JERK_MAX 和 MYM_FWD_JERK_MIN 之间插值。
+	limits.jerk = _config.fwd_jerk_max;
 	limits.err_max_xy = _external.mpcXyErrMax();
 	limits.err_max_z = _external.mpcZErrMax();
 	limits.vel_z_max = _external.mpcZvAutoUp();
@@ -194,6 +199,7 @@ TransitLeg::Limits MyMission::transitLimits() const
 void MyMission::enterTransit(const Tick &tick, State next)
 {
 	_transit.setLimits(transitLimits());
+	_transit_acc_xy = 0.f;    // 调度从"平飞"开始，第一拍用 MYM_FWD_JERK_MAX
 	_transit_acc_along = 0.f;
 	_decel_timer = 0.f;
 
@@ -208,9 +214,54 @@ void MyMission::enterTransit(const Tick &tick, State next)
 	enterState(next, tick.now);
 }
 
+float MyMission::scheduledJerk() const
+{
+	// 低头限幅的口径和 PositionControl 完全一致：MYM_PITCH_MIN（负值）和
+	// MPC_TILTMAX_AIR（正值）里更严的那个，换算成"低头角的绝对值"。
+	float ceiling_deg = _external.mpcTiltmaxAir();
+	const float assist_ceiling_deg = -_external.mymPitchMin();   // MYM_PITCH_MIN < 0
+
+	if (assist_ceiling_deg > 0.f) {
+		ceiling_deg = math::min(ceiling_deg, assist_ceiling_deg);
+	}
+
+	const float jmax = math::max(_config.fwd_jerk_max, 0.1f);
+
+	if (ceiling_deg < 0.1f) {
+		return jmax;   // 没设低头限幅，没有可逼近的目标
+	}
+
+	// 需求姿态 = atan(a_h / g)。a_h 用上一拍实际发出去的水平加速度前馈。
+	const float demand_deg = math::degrees(atanf(_transit_acc_xy / CONSTANTS_ONE_G));
+
+	// 从限幅的这个比例处才开始降 jerk，而不是从 0 就开始降。
+	//
+	// 从 0 开始降的版本实测过：需求角会渐近地逼近限幅（jerk 越小、逼近越慢），
+	// 而轨迹的"速度预算"在同一段时间里被消耗掉 —— MYM_FWD_ACC=4、巡航 6 m/s、
+	// 40 m 的航段上，加速度前馈只爬到 2.53 m/s^2，需求角停在 14.5 度，
+	// 缺额恒为零，推进电机一次都没转起来。
+	// 留出前 80% 的"不干预区"之后，需求角是快速穿过限幅的，穿过之后
+	// 按 MYM_FWD_JERK_MIN 往上走，前推力这才有得补。
+	static constexpr float kScheduleStartRatio = 0.8f;
+
+	const float ratio = math::constrain((demand_deg / ceiling_deg - kScheduleStartRatio)
+					    / (1.f - kScheduleStartRatio), 0.f, 1.f);
+	const float jmin = math::constrain(_config.fwd_jerk_min, 0.1f, jmax);
+
+	// 线性插值，不是阈值开关：开关会让 jerk 在相邻两拍之间反复跳，
+	// 规划出来的加速度斜率也跟着跳，等于自己制造抖动。
+	return jmax + (jmin - jmax) * ratio;
+}
+
 bool MyMission::advanceTransit(const Tick &tick)
 {
+	// 每拍重设一次 jerk：平滑器只在下一次重规划里用它，所以从当前状态往后
+	// 按新限幅走，已经走过的轨迹不动，加速度不会出现跳变。
+	_transit.setJerk(scheduledJerk());
+
 	const TransitLeg::Update u = _transit.update(tick.pos, tick.dt);
+
+	_transit_acc_xy = matrix::Vector2f(u.acceleration(0), u.acceleration(1)).norm();
 
 	// ---- 减速段判定 ----
 	// 沿航向的**有符号**加速度翻负并持续 0.2 s，就认为轨迹进入减速段。
@@ -276,7 +327,7 @@ void MyMission::logTransitStart(const Tick &tick)
 	PX4_INFO("my_mission: %.1f m to go (climb %.1f m), cruise %.2f m/s acc %.2f m/s^2 jerk %.2f, "
 		 "est %.1f s (tilt ~%.0f deg)",
 		 (double)dist, (double)climb, (double)_config.fwd_spd, (double)_config.fwd_acc,
-		 (double)_external.mpcJerkAuto(), (double)t_est,
+		 (double)_config.fwd_jerk_max, (double)t_est,
 		 (double)math::degrees(atanf(_config.fwd_acc / CONSTANTS_ONE_G)));
 
 	if (t_est > _config.fwd_tmo) {
@@ -787,6 +838,7 @@ void MyMission::_startReturnTransit(const Tick &tick)
 	// 和 enterTransit() 做同样的事，但**不能**调它：它会 enterState()，
 	// 而那会把 _return_started 清掉，退回"对准航向"那一步。
 	_transit.setLimits(transitLimits());
+	_transit_acc_xy = 0.f;
 	_transit_acc_along = 0.f;
 	_decel_timer = 0.f;
 

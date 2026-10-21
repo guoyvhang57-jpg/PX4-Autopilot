@@ -57,7 +57,6 @@ public:
 	// PositionSmoothing 的限制（口径同 GotoControl.hpp:99-102）
 	float mpcXyErrMax() const { return value(MpcXyErrMax); }
 	float mpcZErrMax() const { return value(MpcZErrMax); }
-	float mpcJerkAuto() const { return value(MpcJerkAuto); }
 	float mpcXyVelMax() const { return value(MpcXyVelMax); }
 	float mpcZvAutoUp() const { return value(MpcZvAutoUp); }
 	float mpcAccUpMax() const { return value(MpcAccUpMax); }
@@ -77,7 +76,6 @@ private:
 		LndmcZVelMax,
 		MpcXyErrMax,
 		MpcZErrMax,
-		MpcJerkAuto,
 		MpcXyVelMax,
 		MpcZvAutoUp,
 		MpcAccUpMax,
@@ -100,7 +98,6 @@ private:
 		{"LNDMC_Z_VEL_MAX",  PARAM_INVALID, 0.25f},
 		{"MPC_XY_ERR_MAX",   PARAM_INVALID, 2.0f},
 		{"MPC_Z_ERR_MAX",    PARAM_INVALID, 1.0f},
-		{"MPC_JERK_AUTO",    PARAM_INVALID, 4.0f},
 		{"MPC_XY_VEL_MAX",   PARAM_INVALID, 12.0f},
 		{"MPC_Z_V_AUTO_UP",  PARAM_INVALID, 3.0f},
 		{"MPC_ACC_UP_MAX",   PARAM_INVALID, 4.0f},

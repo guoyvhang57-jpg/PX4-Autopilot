@@ -43,6 +43,8 @@ struct MissionConfig {
 	float fwd_dir_deg{0.f};   ///< MYM_FWD_DIR 前飞方向相对机头的偏角 [deg]
 	float fwd_spd{0.5f};      ///< MYM_FWD_SPD 中转巡航速度 [m/s]
 	float fwd_acc{1.f};       ///< MYM_FWD_ACC 中转加减速度上限 [m/s^2]
+	float fwd_jerk_max{4.f};  ///< MYM_FWD_JERK_MAX 离低头限幅远时的 jerk [m/s^3]
+	float fwd_jerk_min{1.f};  ///< MYM_FWD_JERK_MIN 贴着低头限幅时的 jerk [m/s^3]
 	float fwd_tmo{20.f};      ///< MYM_FWD_TMO 中转超时 [s]
 	float hover{5.f};         ///< MYM_HOVER 悬停时间 [s]
 	int land_mode{1};         ///< MYM_LAND_MODE 0 = Offboard 下降，1 = AUTO_LAND

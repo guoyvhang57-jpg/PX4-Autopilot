@@ -142,6 +142,14 @@ private:
 	void stateHover(const Tick &tick);
 	void stateReturn(const Tick &tick);
 	void _startReturnTransit(const Tick &tick);   ///< RETURN 里"对准航向之后"点亮轨迹
+
+	/**
+	 * @brief 本拍该用多大 jerk —— 按需求姿态离低头限幅的比例在 max/min 之间插值
+	 *
+	 * 需求角取自**上一拍发出去的水平加速度前馈**（_transit_acc_xy），
+	 * 只用 20 ms 之前的信息，不构成一个和位置环对抗的环。
+	 */
+	float scheduledJerk() const;
 	void stateLand(const Tick &tick);
 	void stateDisarm(const Tick &tick);
 	void stateDone(const Tick &tick);
@@ -203,6 +211,7 @@ private:
 	matrix::Vector3f _home{};         ///< 返航目标（home 的水平位置 + 当前高度）
 	bool _return_started{false};      ///< RETURN 里：航向已对准、轨迹已点亮
 	matrix::Vector2f _transit_dir{};  ///< 中转航向的水平单位向量，进中转时闩锁
+	float _transit_acc_xy{0.f};       ///< 上一拍发出去的水平加速度前馈的模 [m/s^2]，jerk 调度用
 	float _transit_acc_along{0.f};    ///< 上一拍沿航向的有符号加速度 [m/s^2]，判减速段用
 	float _decel_timer{0.f};          ///< 沿航向加速度连续为负的累计时间 [s]，0.2 s 去抖
 	bool _decel_latched{false};       ///< 本段已进入减速段（单向闩锁，换状态时清）
@@ -237,6 +246,8 @@ private:
 		(ParamFloat<px4::params::MYM_FWD_DIR>) _param_mym_fwd_dir,
 		(ParamFloat<px4::params::MYM_FWD_SPD>) _param_mym_fwd_spd,
 		(ParamFloat<px4::params::MYM_FWD_ACC>) _param_mym_fwd_acc,
+		(ParamFloat<px4::params::MYM_FWD_JERK_MAX>) _param_mym_fwd_jerk_max,
+		(ParamFloat<px4::params::MYM_FWD_JERK_MIN>) _param_mym_fwd_jerk_min,
 		(ParamFloat<px4::params::MYM_FWD_TMO>) _param_mym_fwd_tmo,
 		(ParamFloat<px4::params::MYM_HOVER>) _param_mym_hover,
 		(ParamInt<px4::params::MYM_LAND_MODE>) _param_mym_land_mode,
