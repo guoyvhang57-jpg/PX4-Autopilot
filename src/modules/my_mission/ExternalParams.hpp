@@ -65,6 +65,12 @@ public:
 	/// TILT 段把 MYR_PITCH_DOWN 夹在它以内 [deg]
 	float mpcTiltmaxAir() const { return value(MpcTiltmaxAir); }
 
+	/// 前推力辅助的低头角上限 [deg]，负值 = 低头；0 = 没设。TILT 用它当作"姿态能到多低"的上界
+	float mymPitchMin() const { return value(MymPitchMin); }
+
+	/// 前推力辅助的"缺额 [N] -> 归一化推力"换算系数，TILT 用它把油门反解成加速度
+	float mymFwdThrSc() const { return value(MymFwdThrSc); }
+
 private:
 	enum Index {
 		ManDeadzone = 0,
@@ -76,6 +82,8 @@ private:
 		MpcZvAutoUp,
 		MpcAccUpMax,
 		MpcTiltmaxAir,
+		MymPitchMin,
+		MymFwdThrSc,
 		Count
 	};
 
@@ -97,5 +105,7 @@ private:
 		{"MPC_Z_V_AUTO_UP",  PARAM_INVALID, 3.0f},
 		{"MPC_ACC_UP_MAX",   PARAM_INVALID, 4.0f},
 		{"MPC_TILTMAX_AIR",  PARAM_INVALID, 45.0f},
+		{"MYM_PITCH_MIN",    PARAM_INVALID, -15.0f},
+		{"MYM_FWD_THR_SC",   PARAM_INVALID, 0.44f},
 	};
 };

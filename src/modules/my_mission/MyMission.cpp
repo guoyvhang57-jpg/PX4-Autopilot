@@ -171,6 +171,7 @@ void MyMission::refreshConfig()
 	_config.rope.rope_angle_deg = _param_myr_rope_angle.get();
 	_config.pitch_down_deg = _param_myr_pitch_down.get();
 	_config.tilt_hold = _param_myr_tilt_hold.get();
+	_config.fwd_thr = _param_myr_fwd_thr.get();
 }
 
 // ===========================================================================
@@ -559,7 +560,36 @@ void MyMission::stateTilt(const Tick &tick)
 			 (double)_config.pitch_down_deg, (double)_external.mpcTiltmaxAir());
 	}
 
-	const float a_full = CONSTANTS_ONE_G * tanf(math::radians(pitch_down));
+	// ---- 倾角 + 油门 -> 加速度前馈 ----
+	// 和 PositionControl 那套互为逆运算：
+	//     需求角 = atan(a / g)，夹在低头上限 ceiling
+	//     缺额   = tan(需求角) - tan(ceiling)，乘 MYM_FWD_THR_SC 就是归一化前推力
+	// 所以反过来解：
+	//     油门 = 0  -> a = g * tan(MYR_PITCH_DOWN)                        姿态 = 你给的角度
+	//     油门 > 0  -> a = g * ( tan(ceiling) + 油门 / SC )               姿态 = ceiling，推进电机 = 油门
+	const float sc = _external.mymFwdThrSc();
+	const float thr = math::constrain(_config.fwd_thr, 0.f, 1.f);
+
+	float ceiling_deg = _external.mpcTiltmaxAir();
+	const float assist_ceiling_deg = -_external.mymPitchMin();   // MYM_PITCH_MIN < 0
+
+	if (assist_ceiling_deg > 0.f) {
+		ceiling_deg = math::min(ceiling_deg, assist_ceiling_deg);
+	}
+
+	// 油门一给，姿态必然被夹在上限，倾角参数就没意义了 —— 这和"角度慢慢加"的
+	// 用法一致：油门留 0，只调 MYR_PITCH_DOWN。
+	const float pitch_used = (thr > 1e-3f) ? ceiling_deg
+				 : math::min(pitch_down, ceiling_deg);
+
+	if ((thr > 1e-3f) && (sc < 0.01f) && !_pitch_clamped_warned) {
+		_pitch_clamped_warned = true;
+		PX4_WARN("my_mission: MYR_FWD_THR %.2f needs MYM_FWD_THR_SC > 0 (got %.3f), throttle ignored",
+			 (double)thr, (double)sc);
+	}
+
+	const float a_full = CONSTANTS_ONE_G * (tanf(math::radians(pitch_used))
+						+ ((sc > 0.01f) ? thr / sc : 0.f));
 
 	// ---- 前馈斜坡 ----
 	// 保持时间内目标 = a_full；保持时间到了就把目标改成 0，先退回来再转降落。
@@ -591,8 +621,8 @@ void MyMission::stateTilt(const Tick &tick)
 		// 实际俯仰角。Eulerf 的 theta 正 = 抬头，所以"低头角"要取负。
 		const float pitch_real = -math::degrees(matrix::Eulerf(matrix::Quatf(tick.att.q)).theta());
 
-		PX4_INFO("my_mission: TILT demand %.1f deg, actual %.1f deg, slant %.2f m, rope angle %.1f deg",
-			 (double)pitch_down, (double)pitch_real,
+		PX4_INFO("my_mission: TILT demand %.1f deg (a_ff %.2f, thr %.0f%%), actual %.1f deg, slant %.2f m, rope angle %.1f deg",
+			 (double)pitch_used, (double)_tilt_ff, (double)(thr * 100.f), (double)pitch_real,
 			 (double)RopeGeometry::slant(_rope_solution.anchor, here),
 			 (double)RopeGeometry::angleDeg(_rope_solution.anchor, here));
 	}

@@ -323,6 +323,34 @@ parameters:
       min: 0.0
       max: 600.0
       unit: s
+    MYR_FWD_THR:
+      description:
+        short: 低头时的前推力电机油门
+        long: |-
+          归一化油门（0 ~ 1，和 MYM_FWD_THR_MAX 同一口径），拉绳段低头时给推进电机多少油。
+
+          **一给，姿态就自动钉在低头上限上**（min(|MYM_PITCH_MIN|, MPC_TILTMAX_AIR)，
+          默认 15°），MYR_PITCH_DOWN 被忽略。0 = 不用推进电机，只靠姿态。
+
+          内部换算（和位置环那套互为逆运算）：
+              a = g * ( tan(上限) + 油门 / MYM_FWD_THR_SC )
+          位置环再把 a 反解回需求角、夹在 15°，缺额 tan(需求)-tan(15) 乘
+          MYM_FWD_THR_SC 正好等于这个油门。
+
+          对表（上限 15°、SC 0.44、4 kg）：
+              0.0 -> a =  2.63 m/s^2, 俯仰 -15°, 推进电机   0%, 前向力 10.5 N
+              0.2 -> a =  7.09 m/s^2, 俯仰 -15°, 推进电机  20%, 前向力 28.7 N
+              0.5 -> a = 13.80 m/s^2, 俯仰 -15°, 推进电机  50%, 前向力 55.9 N
+
+          ⚠ 必须 **MYM_FWD_THR_EN = 1**：辅助关掉时姿态照样钉在 15°，
+          但油门那部分力没人出，飞机会被绳拽回去。
+          ⚠ MYM_PITCH_MIN 必须 < 0（默认 -15），设成 0 等于关闭夹紧，这里无从反解。
+      type: float
+      default: 0.0
+      decimal: 2
+      min: 0.0
+      max: 1.0
+      unit: norm
     MYR_PITCH_DOWN:
       description:
         short: 绷紧点上的低头角
@@ -334,7 +362,10 @@ parameters:
           **会被夹到 MPC_TILTMAX_AIR 以内**（默认 45°），超了会告警并夹住。
           φ=20° 时绳张力约 14.6 N，φ=30° 约 23.1 N（都不含推力电机）。
           0 = 不低头：TILT 段照常保持 MYR_TILT_HOLD 秒，只是姿态保持水平。
-          这一段前推力辅助不会出力：位置误差≈0，没有"缺额"可用。
+
+          **MYR_FWD_THR > 0 时这个参数被忽略**：油门一给，姿态就钉在上限上。
+          想"角度慢慢加"就把油门留 0，只调这个值。
+          只开姿态（油门 0）时前推力辅助不会出力：需求角正好等于上限，缺额为零。
       type: float
       default: 15.0
       decimal: 1

@@ -58,6 +58,7 @@ struct MissionConfig {
 	RopeConfig rope{};           ///< MYR_ANCHOR_{X,Y,Z} / MYR_ROPE_LEN / MYR_ROPE_ANGLE
 	float pitch_down_deg{15.f};  ///< MYR_PITCH_DOWN 绷紧点上的低头角 [deg]
 	float tilt_hold{10.f};       ///< MYR_TILT_HOLD 绷紧点上低头保持多久 [s]
+	float fwd_thr{0.f};         ///< MYR_FWD_THR 前推力电机归一化油门；> 0 时姿态钉在低头上限
 
 	/// 是否启用系绳段（MYR_ROPE_LEN > 0）
 	bool ropeEnabled() const { return rope.rope_length > 0.f; }

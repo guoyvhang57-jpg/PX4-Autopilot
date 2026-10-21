@@ -239,6 +239,7 @@ private:
 		(ParamFloat<px4::params::MYR_ROPE_LEN>) _param_myr_rope_len,
 		(ParamFloat<px4::params::MYR_ROPE_ANGLE>) _param_myr_rope_angle,
 		(ParamFloat<px4::params::MYR_PITCH_DOWN>) _param_myr_pitch_down,
-		(ParamFloat<px4::params::MYR_TILT_HOLD>) _param_myr_tilt_hold
+		(ParamFloat<px4::params::MYR_TILT_HOLD>) _param_myr_tilt_hold,
+		(ParamFloat<px4::params::MYR_FWD_THR>) _param_myr_fwd_thr
 	)
 };
