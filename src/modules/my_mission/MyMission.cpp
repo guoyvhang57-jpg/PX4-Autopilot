@@ -371,24 +371,69 @@ void MyMission::stateWait(const Tick &tick)
 	holdCurrentPosition(tick.pos, tick.att, tick.pos_valid);
 	publishSetpoint(targetSetpoint(), tick.now);
 
-	// 三个条件齐了才起飞：
+	// ---- 地面参考 ----
+	// 必须在**还没起飞**、也就是 land detector 说"在地上"的时候锁存。
+	// 手动进场那条路会跳过 TAKEOFF，等它切进 Offboard 时飞机已经在空中了，
+	// 那时再把当前 z 当成地面，Offboard 下降（MYM_LAND_MODE=0）就永远落不下去。
+	if (!_ground_z_latched && tick.pos_valid && tick.land.landed) {
+		_ground_z = tick.pos.z;
+		_ground_z_latched = true;
+	}
+
+	// 三个条件齐了才进下一步：
 	//   armed     —— 电机允许转
 	//   offboard  —— 飞手已经切到 Offboard（本模块不主动切）
 	//   pos_valid —— position 型 Offboard 的前提（EKF 位置可用）
 	if (tick.armed.armed && tick.offboard && tick.pos_valid) {
-		// 记录"地面参考"：NED 里 z 向下，所以地面就是进入 Offboard 时的 z。
-		// 目标高度 = 地面 z - MYM_ALT（减去一个正数 = 往上）。
-		_ground_z = tick.pos.z;
-		_target(2) = _ground_z - _config.alt;
+		const matrix::Vector3f here(tick.pos.x, tick.pos.y, tick.pos.z);
+
+		// ---- 到 home 的三维距离 ----
+		// 用 PX4 的 home_position（**解锁那一刻**的位置），不是 EKF 本地原点：
+		//   原点在整机 EKF 重启之前不变，语义是"这次上电在哪"；
+		//   home 每次解锁都会重设，语义是"这一趟从哪起飞"，更贴近"手动飞出去多远"。
+		// home_position.x/y/z 本来就是本地系坐标，所以直接和当前位置相减。
+		// 没收到 / 无效时退回 EKF 原点，行为和不加这个功能时一致。
+		home_position_s home{};
+		const bool home_valid = _home_position_sub.copy(&home) && home.valid_lpos;
+		const matrix::Vector3f home_pos = home_valid ? matrix::Vector3f(home.x, home.y, home.z)
+						  : matrix::Vector3f();
+		const float dist_home = (here - home_pos).norm();
 
 		// 锁死这一刻的航向。_yaw_sp 是 holdCurrentPosition() 每拍从姿态里抄的，
 		// 出了 WAIT 就没人再刷新它（只有 WAIT/DONE 调 holdCurrentPosition），
-		// 所以它天然就是"起飞时的机头方向"，后面 Forward/Rope 直接拿来用。
+		// 所以它天然就是"此刻的机头方向"，TILT / FORWARD 直接拿来用。
 		_takeoff_yaw = _yaw_sp;
 
-		enterState(State::Takeoff, tick.now);
-		PX4_INFO("my_mission: TAKEOFF -> %.2f m (yaw %.0f deg)", (double)_config.alt,
-			 (double)math::degrees(_takeoff_yaw));
+		// ===============================================================
+		// 手动进场：开着绳 + 已经离地 + 离原点超过 MYM_ARRIVE
+		// ===============================================================
+		// 说明飞手是**手动**把飞机飞到"绳快要绷紧"的地方才切进 Offboard 的，
+		// 那就不要爬升、不要飞中转段，直接进 TILT 开始拉。
+		//
+		// ⚠ 必须要求 !landed：地上的飞机被人挪过位置（离原点 > MYM_ARRIVE）时，
+		// 一进 Offboard 就会坐在地上拉绳，会翻。
+		if (_config.rope_test && !tick.land.landed && (dist_home > _config.arrive)) {
+			// 三轴都用当前值：手动飞过来的高度就是拉绳高度，不套 MYM_ALT。
+			_target = here;
+			_target_valid = true;
+			_tilt_ff = 0.f;
+			_last_rope_log = 0;
+			enterState(State::Tilt, tick.now);
+			PX4_INFO("my_mission: manual entry %.2f m from %s (%.2f m above ground) -> PULL %.1f deg, %.1f s",
+				 (double)dist_home, home_valid ? "home" : "EKF origin",
+				 (double)(_ground_z - here(2)),
+				 (double)_config.pitch_down_deg, (double)_config.tilt_hold);
+
+		} else {
+			// 正常流程：从地面起飞。地面参考就是此刻的 z（这时还在原地/地上）。
+			_ground_z = tick.pos.z;
+			_ground_z_latched = true;
+			_target(2) = _ground_z - _config.alt;
+
+			enterState(State::Takeoff, tick.now);
+			PX4_INFO("my_mission: TAKEOFF -> %.2f m (yaw %.0f deg)", (double)_config.alt,
+				 (double)math::degrees(_takeoff_yaw));
+		}
 	}
 }
 

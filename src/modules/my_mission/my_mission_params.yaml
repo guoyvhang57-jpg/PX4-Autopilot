@@ -222,6 +222,11 @@ parameters:
             - 沿起飞航向发一条加速度前馈，大小由 MYR_PITCH_DOWN / MYR_FWD_THR 反解
             - 保持 MYR_TILT_HOLD 秒，然后退回前馈、转 HOVER
 
+          两种进场方式都被识别：
+            - 在地面 arm 再切 Offboard -> 正常起飞到 MYM_ALT 后进 TILT
+            - 先手动飞到绳快绷紧的地方再切 Offboard -> 离 home 超过 MYM_ARRIVE
+              且已经离地，就直接进 TILT，不爬升、不飞中转
+
           ⚠ 仿真里必须让绳在起飞时就绷紧（GZ_TETHER=1，绳长和锚点按现场摆）。
           否则飞机低头之后只会往前飞，测不到拉力。
       type: enum

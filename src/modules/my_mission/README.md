@@ -35,14 +35,16 @@ Offboard 位置控制的最小任务示例：**起飞到指定高度 → 向前�
 ## 状态机
 
 ```
-WAIT ──手势解锁 + 进 Offboard──> TAKEOFF ──到达 MYM_ALT──>
-       ├─ MYR_ROPE_EN = 1 ──> TILT ──MYR_TILT_HOLD 秒──> HOVER
-       ├─ MYM_FWD_DIST > 0 ──> FORWARD ──到位──────────> HOVER
-       └─ 都没有 ────────────────────────────────────> HOVER
+WAIT ──手势解锁 + 进 Offboard──>
+       ├─ 开绳 + 已离地 + 离 home > MYM_ARRIVE ──> TILT（手动进场，不爬升、不飞中转）
+       └─ 否则 ──> TAKEOFF ──到达 MYM_ALT──>
+                    ├─ MYR_ROPE_EN = 1 ──> TILT ──MYR_TILT_HOLD 秒──> HOVER
+                    ├─ MYM_FWD_DIST > 0 ──> FORWARD ──到位─────────> HOVER
+                    └─ 都没有 ───────────────────────────────────> HOVER
      ──MYM_HOVER 秒──> LAND ──> DISARM ──> DONE ──(已上锁)──> WAIT（可以再跑一遍）
 ```
 
-**目的地只有一个，在 `TAKEOFF` 到位那一刻二选一，之后不再改：**
+**起飞到位之后走哪条路，在那一刻定死：**
 
 | 配置 | 做什么 | 之后 |
 |---|---|---|
@@ -103,7 +105,26 @@ WAIT ──手势解锁 + 进 Offboard──> TAKEOFF ──到达 MYM_ALT──
 
 ## 拉绳测试（`MYR_ROPE_EN = 1`）
 
-打开开关之后，`TAKEOFF` 到位**直接进 `TILT`**：不飞中转段，不算绷紧点。
+打开开关之后有两条进场方式：
+
+**地面起飞** —— `TAKEOFF` 到位直接进 `TILT`，不飞中转段。
+
+**手动进场** —— 先用手动模式（POSCTL）把飞机飞到绳快要绷紧的地方，再切 Offboard。
+`WAIT` 里一看到 Offboard 就判断"到 **PX4 `home_position`** 的三维距离"（那个点
+在**解锁那一刻**设，每次解锁都重设，语义是"这一趟从哪起飞"），超过 `MYM_ARRIVE`
+且**已经离地**，就跳过起飞直接进 `TILT`，三轴目标都取当前位置（不套 `MYM_ALT`）。
+
+没收到 `home_position`（或它的 `valid_lpos` 为 false）时退回 EKF 本地原点，
+也就是"这次上电在哪"，行为和不加这个功能时一致。日志里会写清楚用的是哪个：
+
+```
+my_mission: manual entry 8.32 m from home (4.87 m above ground) -> PULL 10.0 deg, 10.0 s
+```
+
+判据里的 `!landed` 是安全护栏：地上的飞机被人挪过位置时，离原点也会超过
+`MYM_ARRIVE`，不加这条会坐在地上拉绳。
+
+⚠ 手动进场这条路**落地就在拉绳的地方**，不返回原点（没有起飞点可回）。
 
 ```
 TAKEOFF ──到达 MYM_ALT──> TILT ──MYR_TILT_HOLD 秒──> HOVER ──> LAND

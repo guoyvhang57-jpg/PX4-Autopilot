@@ -58,6 +58,7 @@
 
 #include <uORB/Subscription.hpp>
 #include <uORB/topics/actuator_armed.h>
+#include <uORB/topics/home_position.h>
 #include <uORB/topics/manual_control_setpoint.h>
 #include <uORB/topics/parameter_update.h>
 #include <uORB/topics/vehicle_attitude.h>
@@ -190,7 +191,8 @@ private:
 	matrix::Vector3f _target{};       ///< 位置环目标，机体系无关的本地 NED 坐标
 	matrix::Vector3f _goal3{};        ///< 中转目标（三维 NED）
 	float _goal_distance{0.f};        ///< 平滑器离终点还剩多远（到位判据 / 超时日志用）
-	float _ground_z{0.f};             ///< 进入 Offboard 时的 z（NED），作为降落的目标地面高度
+	float _ground_z{0.f};             ///< 地面参考的 z（NED），在 WAIT 里落地时就锁存，作为降落目标
+	bool _ground_z_latched{false};    ///< 只在**还没起飞**时锁存一次；手动进场时进 Offboard 已经在空中了
 	float _yaw_sp{0.f};               ///< 锁存的航向，每拍原样发给 trajectory_setpoint.yaw
 	float _takeoff_yaw{0.f};          ///< 起飞那一刻的航向，Forward 用它算"机头正前方"
 
@@ -209,6 +211,7 @@ private:
 	uORB::Subscription _local_pos_sub{ORB_ID(vehicle_local_position)}; // 位置/速度/有效性
 	uORB::Subscription _attitude_sub{ORB_ID(vehicle_attitude)};        // 只用来取当前航向
 	uORB::Subscription _land_detected_sub{ORB_ID(vehicle_land_detected)}; // landed 判据
+	uORB::Subscription _home_position_sub{ORB_ID(home_position)};      // 解锁时设的 home，判断手动进场用
 	uORB::Subscription _manual_control_sub{ORB_ID(manual_control_setpoint)}; // 接管安全：油门杆位置
 
 	// 参数默认值/含义见 my_mission_params.yaml；改完不用重启模块（Run 里 updateParams）
