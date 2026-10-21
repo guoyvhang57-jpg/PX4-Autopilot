@@ -124,9 +124,12 @@ void MissionOutput::publishSetpoint(const Setpoint &setpoint, hrt_abstime now)
 		tsp.velocity[2] = setpoint.z_velocity;
 	}
 
-	// yaw 每拍都给锁存值（不然可能自己转）；yawspeed 给 NaN = 不控制偏航角速度。
+	// yaw 每拍都给锁存值（不然可能自己转）。
+	// yawspeed 默认 NaN = 不控制偏航角速度；只有返航掉头时给有限值，作为
+	// "航向给定正在以多快转"的前馈 —— 姿态环的参考模型会直接按这个速率转，
+	// 不用靠角度误差去喂（那需要稳定的超前角，误差 x MC_YAW_P 才等于角速率）。
 	tsp.yaw = setpoint.yaw;
-	tsp.yawspeed = NAN;
+	tsp.yawspeed = setpoint.yawspeed;
 
 	_traj_sp_pub.publish(tsp);
 }

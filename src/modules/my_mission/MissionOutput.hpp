@@ -56,6 +56,7 @@ public:
 		matrix::Vector3f acceleration{NAN, NAN, NAN};
 		float z_velocity{NAN};   ///< 向下为正；只有 Offboard 自己下降时给
 		float yaw{0.f};
+		float yawspeed{NAN};     ///< 偏航角速度前馈 [rad/s]；NaN = 不控制（只有返航掉头给）
 	};
 
 	MissionOutput() = default;

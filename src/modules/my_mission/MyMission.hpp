@@ -58,6 +58,7 @@
 
 #include <uORB/Subscription.hpp>
 #include <uORB/topics/actuator_armed.h>
+#include <uORB/topics/vehicle_angular_velocity.h>
 #include <uORB/topics/home_position.h>
 #include <uORB/topics/manual_control_setpoint.h>
 #include <uORB/topics/parameter_update.h>
@@ -150,6 +151,12 @@ private:
 	 * 只用 20 ms 之前的信息，不构成一个和位置环对抗的环。
 	 */
 	float scheduledJerk() const;
+
+	/// 航向是否已经稳定在 target_yaw 上：误差够小 **而且** 不再转
+	bool yawSettled(const Tick &tick, float target_yaw);
+
+	/// 让偏航给定以固定速率斜坡到 target_yaw，并把 setpoint 发出去（用当前 _target）
+	void _rampYaw(const Tick &tick, float target_yaw);
 	void stateLand(const Tick &tick);
 	void stateDisarm(const Tick &tick);
 	void stateDone(const Tick &tick);
@@ -210,6 +217,10 @@ private:
 	matrix::Vector3f _goal3{};        ///< 中转目标（三维 NED）
 	matrix::Vector3f _home{};         ///< 返航目标（home 的水平位置 + 当前高度）
 	bool _return_started{false};      ///< RETURN 里：航向已对准、轨迹已点亮
+	bool _home_yaw_done{false};       ///< RETURN 里：已到家，正在把航向转回初始方向
+	hrt_abstime _home_rot_start{0};   ///< 到家后开始转航向的时刻，给这一步单独的预算
+	float _yaw_target{0.f};           ///< 斜坡的终点（返航两个掉头阶段各设一次）
+	bool _yaw_ramp_started{false};    ///< 斜坡已从实测机头起步（每段重置一次）
 	matrix::Vector2f _transit_dir{};  ///< 中转航向的水平单位向量，进中转时闩锁
 	float _transit_acc_xy{0.f};       ///< 上一拍发出去的水平加速度前馈的模 [m/s^2]，jerk 调度用
 	float _transit_acc_along{0.f};    ///< 上一拍沿航向的有符号加速度 [m/s^2]，判减速段用
@@ -237,6 +248,7 @@ private:
 	uORB::Subscription _attitude_sub{ORB_ID(vehicle_attitude)};        // 只用来取当前航向
 	uORB::Subscription _land_detected_sub{ORB_ID(vehicle_land_detected)}; // landed 判据
 	uORB::Subscription _home_position_sub{ORB_ID(home_position)};      // 解锁时设的 home，判断手动进场用
+	uORB::Subscription _angular_velocity_sub{ORB_ID(vehicle_angular_velocity)}; // RETURN 掉头判据用
 	uORB::Subscription _manual_control_sub{ORB_ID(manual_control_setpoint)}; // 接管安全：油门杆位置
 
 	// 参数默认值/含义见 my_mission_params.yaml；改完不用重启模块（Run 里 updateParams）

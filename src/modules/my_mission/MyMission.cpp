@@ -42,6 +42,16 @@
 
 #include <px4_platform_common/log.h>
 
+// 航向对准判据（返航前掉头、到家后转回初始航向都用它）。
+// 只判角度不行：飞机可能刚好扫到"误差很小"的那一瞬间，但还在 60 °/s 地转，
+// 轨迹一开就是斜着出去的。所以角度和角速度都要收敛。
+static constexpr float kReturnYawErrMax = 5.f;    // [deg] 航向误差上限
+static constexpr float kReturnYawRateMax = 1.f;   // [deg/s] 角速度上限
+// 返航阶段的偏航给定按这个速率斜坡过去，不一步跳过去 —— 直接给目标航向的话
+// 姿态环会按 MC_YAWRATE_MAX（默认 200 °/s）猛甩，机体和绳都被甩一下。
+// 定死，不做成参数：它只影响返航掉头的手感，和性能无关。
+static constexpr float kReturnYawSlew = 30.f;      // [deg/s]
+
 ModuleBase::Descriptor MyMission::desc{task_spawn, custom_command, print_usage};
 
 MyMission::MyMission()
@@ -212,6 +222,55 @@ void MyMission::enterTransit(const Tick &tick, State next)
 	_transit.start(_goal3, tick.pos);
 
 	enterState(next, tick.now);
+}
+
+void MyMission::_rampYaw(const Tick &tick, float target_yaw)
+{
+	// 给定值自己是状态量，按 kReturnYawSlew 往下走；同时把"正在以多快转"
+	// 用 yawspeed 前馈给姿态环。
+	//
+	// 为什么必须给前馈：姿态环的偏航是"角度误差 x MC_YAW_P -> 角速率"。
+	// 只给角度斜坡的话，要么误差永远只有一步（0.6° -> 只转 1.7 °/s，太慢），
+	// 要么靠误差自然长大到 30/2.8 ≈ 11° 才有 30 °/s（要等、还在收尾时超调）。
+	// 把速率直接前馈过去，参考模型就按这个速率转，角度差保持≈0。
+	if (!_yaw_ramp_started) {
+		// 从**实测机头方向**起步，避免第一拍跳一大步
+		_yaw_sp = matrix::Eulerf(matrix::Quatf(tick.att.q)).psi();
+		_yaw_ramp_started = true;
+	}
+
+	const float step = math::radians(kReturnYawSlew) * tick.dt;
+	const float remaining = matrix::wrap_pi(target_yaw - _yaw_sp);
+
+	MissionOutput::Setpoint setpoint = targetSetpoint();
+	float yawspeed = 0.f;
+
+	if (fabsf(remaining) > step) {
+		const float dir = (remaining > 0.f) ? 1.f : -1.f;
+		_yaw_sp = matrix::wrap_pi(_yaw_sp + dir * step);
+		yawspeed = dir * math::radians(kReturnYawSlew);
+
+	} else {
+		_yaw_sp = target_yaw;   // 最后一步直接落到目标上
+	}
+
+	_yaw_target = target_yaw;
+	setpoint.yaw = _yaw_sp;
+	setpoint.yawspeed = yawspeed;
+	publishSetpoint(setpoint, tick.now);
+}
+
+bool MyMission::yawSettled(const Tick &tick, float target_yaw)
+{
+	const float yaw_now = matrix::Eulerf(matrix::Quatf(tick.att.q)).psi();
+	const float yaw_err = fabsf(matrix::wrap_pi(target_yaw - yaw_now));
+
+	// 角速度取机体 z 轴（FRD，正 = 右转）。倾斜很小时它就是航向角速度。
+	vehicle_angular_velocity_s ang_vel{};
+	const float yaw_rate = _angular_velocity_sub.copy(&ang_vel)
+			       ? fabsf(math::degrees(ang_vel.xyz[2])) : 0.f;
+
+	return (yaw_err < math::radians(kReturnYawErrMax)) && (yaw_rate < kReturnYawRateMax);
 }
 
 float MyMission::scheduledJerk() const
@@ -459,6 +518,7 @@ void MyMission::Run()
  */
 static constexpr float kTiltFfSlew = 2.5f;
 
+
 void MyMission::stateWait(const Tick &tick)
 {
 	// 进 Offboard 之前：目标 = 当前位置。位置环就算已经在跑也不会动。
@@ -504,10 +564,19 @@ void MyMission::stateWait(const Tick &tick)
 
 		const float dist_home = (here - home_pos).norm();
 
-		// 锁死这一刻的航向。_yaw_sp 是 holdCurrentPosition() 每拍从姿态里抄的，
-		// 出了 WAIT 就没人再刷新它（只有 WAIT/DONE 调 holdCurrentPosition），
-		// 所以它天然就是"此刻的机头方向"，TILT / FORWARD 直接拿来用。
-		_takeoff_yaw = _yaw_sp;
+		// ---- 航向也统一到 home ----
+		// home_position 是解锁那一刻的快照，里面连姿态一起存了（fillLocalHomePos
+		// 抄的是当时的 vehicle_attitude），所以 home.yaw 就是"解锁时的机头方向"。
+		// 用它当整趟任务的航向基准：FORWARD 的 MYM_FWD_DIR、TILT 的前馈方向、
+		// RETURN 最后要转回的目标，全部相对它。
+		//
+		// _yaw_sp 同时改成这个值：起飞阶段就把机头摆正，否则"航向基准"和
+		// "实际机头"会差一个角，Forward 就变成斜着飞。
+		//
+		// 没有有效的 home（没解锁过 / 话题没来）才退回"此刻的机头方向"。
+		_takeoff_yaw = home_valid ? home.yaw : _yaw_sp;
+		_yaw_sp = _takeoff_yaw;
+		_home_yaw_done = false;
 
 		// ===============================================================
 		// 手动进场：开着绳 + 已经离地 + 离原点超过 MYM_ARRIVE
@@ -760,7 +829,7 @@ void MyMission::stateHover(const Tick &tick)
 	publishSetpoint(targetSetpoint(), tick.now);
 
 	if (elapsedSince(_state_start, tick.now) >= _config.hover) {
-		// 悬停结束**不直接降落**：先飞回 home（解锁时设的那个点），到了再落。
+		// 还没到家：先飞回 home（解锁时设的那个点），到了再落。
 		// 高度取当前值 —— 回家是同高度平飞，不是降到地面。
 		home_position_s home{};
 		const bool home_valid = _home_position_sub.copy(&home) && home.valid_lpos;
@@ -796,13 +865,10 @@ void MyMission::stateReturn(const Tick &tick)
 			return;
 		}
 
-		_yaw_sp = atan2f(to_home(1), to_home(0));
 		_target = matrix::Vector3f(tick.pos.x, tick.pos.y, tick.pos.z);
-		publishSetpoint(targetSetpoint(), tick.now);
+		_rampYaw(tick, atan2f(to_home(1), to_home(0)));
 
-		const float yaw_now = matrix::Eulerf(matrix::Quatf(tick.att.q)).psi();
-
-		if (fabsf(matrix::wrap_pi(_yaw_sp - yaw_now)) < math::radians(5.f)) {
+		if (yawSettled(tick, _yaw_target)) {
 			_startReturnTransit(tick);
 
 		} else if (elapsedSince(_state_start, tick.now) > _config.fwd_tmo) {
@@ -815,17 +881,41 @@ void MyMission::stateReturn(const Tick &tick)
 		return;
 	}
 
-	if (advanceTransit(tick)) {
-		_target = _goal3;
+	if (!_home_yaw_done) {
+		if (advanceTransit(tick)) {
+			// 到家了。先别降落：把机头转回起飞时的方向，转好再进悬停。
+			_target = _goal3;
+			_home_yaw_done = true;
+			_home_rot_start = tick.now;
+			_yaw_ramp_started = false;
+			PX4_INFO("my_mission: home reached [%.2f %.2f], aligning heading to %.0f deg",
+				 (double)_goal3(0), (double)_goal3(1), (double)math::degrees(_takeoff_yaw));
+
+		} else if (elapsedSince(_state_start, tick.now) > _config.fwd_tmo) {
+			// 飞不回去（顶风 / 航向歪 / 位置估计漂）也不能一直在外面转：
+			// 就地降落，降落本身是保底功能。
+			PX4_WARN("my_mission: return timeout (traj %.2f m from home), landing here", (double)_goal_distance);
+			enterState(State::Land, tick.now);
+			_land_cmd_sent = false;
+		}
+
+		return;
+	}
+
+	// ---- 在 home 原地把航向转回初始方向 ----
+	// 位置保持在 home 上，只改 yaw 给定。转好之后**直接降落**，不停留 ——
+	// 这样落地时的机头方向和起飞前一致，不会歪着停在地上。
+	_target = _goal3;
+	_rampYaw(tick, _takeoff_yaw);
+
+	if (yawSettled(tick, _yaw_target)) {
 		enterState(State::Land, tick.now);
 		_land_cmd_sent = false;
-		PX4_INFO("my_mission: home reached [%.2f %.2f], LAND (mode %d)",
-			 (double)_goal3(0), (double)_goal3(1), _config.land_mode);
+		PX4_INFO("my_mission: heading aligned, LAND (mode %d)", _config.land_mode);
 
-	} else if (elapsedSince(_state_start, tick.now) > _config.fwd_tmo) {
-		// 飞不回去（顶风 / 航向歪 / 位置估计漂）也不能一直在外面转：
-		// 就地降落，降落本身是保底功能。
-		PX4_WARN("my_mission: return timeout (traj %.2f m from home), landing here", (double)_goal_distance);
+	} else if (elapsedSince(_home_rot_start, tick.now) > 10_s) {
+		// 转不过来也不能卡住：就按当前航向降落
+		PX4_WARN("my_mission: heading alignment timeout, landing as-is");
 		enterState(State::Land, tick.now);
 		_land_cmd_sent = false;
 	}
