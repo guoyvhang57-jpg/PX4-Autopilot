@@ -59,6 +59,7 @@
 #include <uORB/Subscription.hpp>
 #include <uORB/SubscriptionCallback.hpp>
 #include <uORB/topics/hover_thrust_estimate.h>
+#include <uORB/topics/my_mission_assist.h>
 #include <uORB/topics/parameter_update.h>
 #include <uORB/topics/trajectory_setpoint.h>
 #include <uORB/topics/vehicle_attitude_setpoint.h>
@@ -110,6 +111,10 @@ private:
 	uORB::Subscription _vehicle_constraints_sub{ORB_ID(vehicle_constraints)};
 	uORB::Subscription _vehicle_control_mode_sub{ORB_ID(vehicle_control_mode)};
 	uORB::Subscription _vehicle_land_detected_sub{ORB_ID(vehicle_land_detected)};
+	uORB::Subscription _my_mission_assist_sub{ORB_ID(my_mission_assist)};	/**< 前推力辅助的阶段许可 */
+
+	hrt_abstime _assist_timestamp{0};		/**< 上一帧阶段许可的时间戳，用来判超时 */
+	bool _assist_enabled_by_mission{true};		/**< 没收到或超时时按"允许"处理 */
 
 	hrt_abstime _time_stamp_last_loop{0};		/**< time stamp of last loop iteration */
 	hrt_abstime _time_position_control_enabled{0};

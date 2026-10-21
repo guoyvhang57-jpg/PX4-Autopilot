@@ -154,3 +154,13 @@ void MissionOutput::publishCommand(uint16_t command, float param1, float param2)
 	cmd.from_external = false;
 	_vehicle_command_pub.publish(cmd);
 }
+
+void MissionOutput::publishAssist(bool enabled, hrt_abstime now)
+{
+	// 时间戳每拍刷新：控制器用 "now - timestamp < 500 ms" 判这条通道是否还活着，
+	// 超时按"允许"处理（回到参数控制的行为），所以模块挂掉不会静默关掉辅助。
+	my_mission_assist_s assist{};
+	assist.timestamp = now;
+	assist.enabled = enabled;
+	_assist_pub.publish(assist);
+}

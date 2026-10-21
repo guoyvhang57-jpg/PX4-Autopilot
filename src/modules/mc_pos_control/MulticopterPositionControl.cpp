@@ -411,6 +411,21 @@ void MulticopterPositionControl::Run()
 
 		_vehicle_land_detected_sub.update(&_vehicle_land_detected);
 
+		// 任务模块的阶段许可（前推力辅助）。发 false 时位置环完全回到原逻辑：
+		// 不夹低头角、不产出前推力。超时按"允许"处理 —— 模块挂掉不能静默把辅助关死。
+		{
+			my_mission_assist_s assist{};
+
+			if (_my_mission_assist_sub.copy(&assist)) {
+				_assist_timestamp = assist.timestamp;
+				_assist_enabled_by_mission = assist.enabled;
+			}
+
+			if (hrt_absolute_time() - _assist_timestamp > 500_ms) {
+				_assist_enabled_by_mission = true;
+			}
+		}
+
 		if (_hover_thrust_estimate_sub.updated()) {
 			hover_thrust_estimate_s hte;
 
@@ -533,7 +548,8 @@ void MulticopterPositionControl::Run()
 			// with no access to the flight mode. It also ignores a non-negative MYM_PITCH_MIN, so a
 			// misconfiguration cannot force a nose-up attitude.
 			_control.setForwardThrust(_param_mym_fwd_thr_en.get() != 0
-						  && _vehicle_control_mode.flag_control_offboard_enabled,
+						  && _vehicle_control_mode.flag_control_offboard_enabled
+						  && _assist_enabled_by_mission,
 						  math::radians(_param_mym_pitch_min.get()),
 						  _param_mym_fwd_thr_sc.get(),
 						  _param_mym_fwd_thr_max.get());

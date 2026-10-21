@@ -41,8 +41,23 @@ WAIT ──手势解锁 + 进 Offboard──>
                     ├─ MYR_ROPE_EN = 1 ──> TILT ──MYR_TILT_HOLD 秒──> HOVER
                     ├─ MYM_FWD_DIST > 0 ──> FORWARD ──到位─────────> HOVER
                     └─ 都没有 ───────────────────────────────────> HOVER
-     ──MYM_HOVER 秒──> LAND ──> DISARM ──> DONE ──(已上锁)──> WAIT（可以再跑一遍）
+     ──MYM_HOVER 秒──> RETURN（先对准 home，再飞回去）──到位──> LAND
+     ──> DISARM ──> DONE ──(已上锁)──> WAIT（可以再跑一遍）
 ```
+
+**所有位置参考都统一到 home**（PX4 `home_position`，**解锁那一刻**的位置，每次解锁重设）：
+
+| 用途 | 参考 |
+|---|---|
+| `TAKEOFF` 起飞点 | home 的 x/y |
+| `TAKEOFF` 目标高度 | `home.z − MYM_ALT`（`home.z` 就是那块地的地面） |
+| `FORWARD` 终点 | home 的 x/y + `MYM_FWD_DIST` |
+| 手动进场判据 | 到 home 的三维距离 |
+| `RETURN` 目标 | home 的 x/y + 当前高度 |
+| Offboard 下降目标 | `home.z` |
+
+`home_position` 无效时全部退回"当前位置 + 锁存的地面"，行为和不加这套逻辑时一样。
+唯一有意不以 home 为准的是**手动进场的拉绳点**——它的定义就是"飞手现在停在哪"。
 
 **起飞到位之后走哪条路，在那一刻定死：**
 
@@ -83,6 +98,25 @@ WAIT ──手势解锁 + 进 Offboard──>
 > ⚠ **"前方"完全由航向估计决定**（GPS 双天线 / 磁罗盘 / EKF）。航向歪多少度，飞出去就歪多少度，
 > 而且 `MYM_FWD_DIST` 越大偏得越远（3 m 上偏 30° ≈ 1.5 m）。
 > 第一次试：`MYM_FWD_DIST` 给 1~2 m、`MYM_ALT` 给 ≥ 2 m，开阔场地，随时能切回 Position。
+
+### 返航（`RETURN`）
+
+悬停结束**不直接降落**：先飞回 **home**（px4 `home_position`，也就是**解锁那一刻**的
+位置；每次解锁都会重设），到了再走 `LAND`。降落功能本身没动，`MYM_LAND_MODE` 两种
+方式照旧，只是起点变成了 home。
+
+分两步：
+
+1. **原地对准航向** —— 算出到 home 的方位角，用它当 yaw 目标，位置保持在原地；
+   航向误差小于 5° 才进下一步。距离小于 1 m 时跳过（没有方向可言）。
+2. **飞回去** —— 复用 `FORWARD` 那套 `TransitLeg`：同一个 `PositionSmoothing`、
+   同一套速度/加减速/jerk 限制（`MYM_FWD_SPD` / `MYM_FWD_ACC` / `MYM_FWD_JERK_*`）、
+   同一个到位判据（`MYM_ARRIVE` + 速度 < 0.3 m/s）和超时（`MYM_FWD_TMO`）。
+
+**高度用当前值**，回家是同高度平飞，不是降到地面。
+
+`home_position` 无效（没解锁过、话题没来）时就地降落并打一条 `PX4_WARN`，
+不会乱飞。返航超时同样就地降落。
 
 ## 参数（`MYM_`）
 

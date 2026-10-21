@@ -32,6 +32,7 @@
 #include <matrix/matrix/math.hpp>
 #include <px4_platform_common/defines.h>
 #include <uORB/Publication.hpp>
+#include <uORB/topics/my_mission_assist.h>
 #include <uORB/topics/offboard_control_mode.h>
 #include <uORB/topics/trajectory_setpoint.h>
 #include <uORB/topics/vehicle_command.h>
@@ -71,10 +72,14 @@ public:
 
 	void publishCommand(uint16_t command, float param1 = 0.f, float param2 = 0.f);
 
+	/// 前推力辅助的阶段许可。每拍一次；控制器在超时后按"允许"处理
+	void publishAssist(bool enabled, hrt_abstime now);
+
 private:
 	bool _offboard{false};
 
 	uORB::Publication<offboard_control_mode_s> _ocm_pub{ORB_ID(offboard_control_mode)};
 	uORB::Publication<trajectory_setpoint_s> _traj_sp_pub{ORB_ID(trajectory_setpoint)};
 	uORB::Publication<vehicle_command_s> _vehicle_command_pub{ORB_ID(vehicle_command)};
+	uORB::Publication<my_mission_assist_s> _assist_pub{ORB_ID(my_mission_assist)};
 };

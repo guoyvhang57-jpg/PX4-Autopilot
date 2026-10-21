@@ -6,8 +6,8 @@ parameters:
       description:
         short: 起飞目标高度
         long: |-
-          进入 Offboard 后相对"进入点"（通常是地面）上升多少，单位 m。
-          目标位置 = 进入时的位置，z 再减去这个值（NED 向上为负）。
+          进入 Offboard 后相对 **home 的地面** 上升多少，单位 m。
+          起飞点 = home 的 x/y，目标 z = home 的 z 减去这个值（NED 向上为负）。
 
           ⚠ 拉绳测试（MYR_ROPE_EN = 1）时，绳的几何要摆成"爬到这个高度时绳已经
           绷紧或者刚好绷紧"。绳长在 SDF 的 <rope_length> 里、锚点在 <anchor_offset>
@@ -24,7 +24,8 @@ parameters:
         short: 起飞后向前飞的距离
         long: |-
           到了 MYM_ALT 之后，沿"起飞那一刻锁定的机头方向"（不是正北）再平飞这么远，
-          到点后悬停 MYM_HOVER 秒再降落。单位 m。
+          到点后悬停 MYM_HOVER 秒，然后返航回 home、降落。单位 m。
+          **起点是 home**（解锁时设的点），不是"进入 Offboard 时的位置"。
           0 = 不飞：跳过 FORWARD 状态，行为和不启用这个功能时完全一样。
           拉绳测试（MYR_ROPE_EN = 1）时这个参数**不生效**：那一段是 TAKEOFF 直接进
           TILT，不飞中转。
@@ -99,7 +100,7 @@ parameters:
       description:
         short: 到达目标点后的悬停时间
         long: |-
-          到达**前方点**后保持多久再开始降落，单位 s。
+          到达前方点 / 拉绳段结束之后，保持多久再开始**返航**（不是降落），单位 s。
           拉绳测试也用不到它（那一段用 MYR_TILT_HOLD）。
           另外"既没开绳、MYM_FWD_DIST 也是 0"的情况下，起飞后也是悬停这么久再降落。
       type: float

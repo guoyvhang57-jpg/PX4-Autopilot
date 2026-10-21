@@ -102,6 +102,7 @@ private:
 		Forward,  ///< 用 TransitLeg 飞到前方点（MYM_FWD_DIST / MYM_FWD_DIR）
 		Tilt,     ///< 拉绳：目标留在起飞点，按 MYR_PITCH_DOWN / MYR_FWD_THR 发前馈，保持 MYR_TILT_HOLD 秒
 		Hover,    ///< 保持同一 setpoint MYM_HOVER 秒
+		Return,   ///< 先把机头对准 home，再飞回去（复用 FORWARD 的逻辑）
 		Land,     ///< 方式 1：发 NAV_LAND 交 AUTO_LAND；方式 0：自己把 z 斜坡拉回地面
 		Disarm,   ///< 发 COMPONENT_ARM_DISARM(param1=0)，1 Hz 重试直到 !armed
 		Done,     ///< 结束；已上锁就回 Wait，允许再跑一遍
@@ -139,11 +140,20 @@ private:
 	void stateForward(const Tick &tick);
 	void stateTilt(const Tick &tick);
 	void stateHover(const Tick &tick);
+	void stateReturn(const Tick &tick);
+	void _startReturnTransit(const Tick &tick);   ///< RETURN 里"对准航向之后"点亮轨迹
 	void stateLand(const Tick &tick);
 	void stateDisarm(const Tick &tick);
 	void stateDone(const Tick &tick);
 
-	void enterState(State next, hrt_abstime now) { _state = next; _state_start = now; }
+	void enterState(State next, hrt_abstime now)
+	{
+		_state = next;
+		_state_start = now;
+		_decel_latched = false;
+		_decel_timer = 0.f;
+		_return_started = false;
+	}
 
 	// ---- 中转（FORWARD / ROPE 共用）----
 	TransitLeg::Limits transitLimits() const;
@@ -190,6 +200,12 @@ private:
 	bool _target_valid{false};        ///< false 时 trajectory_setpoint 的位置发 NaN
 	matrix::Vector3f _target{};       ///< 位置环目标，机体系无关的本地 NED 坐标
 	matrix::Vector3f _goal3{};        ///< 中转目标（三维 NED）
+	matrix::Vector3f _home{};         ///< 返航目标（home 的水平位置 + 当前高度）
+	bool _return_started{false};      ///< RETURN 里：航向已对准、轨迹已点亮
+	matrix::Vector2f _transit_dir{};  ///< 中转航向的水平单位向量，进中转时闩锁
+	float _transit_acc_along{0.f};    ///< 上一拍沿航向的有符号加速度 [m/s^2]，判减速段用
+	float _decel_timer{0.f};          ///< 沿航向加速度连续为负的累计时间 [s]，0.2 s 去抖
+	bool _decel_latched{false};       ///< 本段已进入减速段（单向闩锁，换状态时清）
 	float _goal_distance{0.f};        ///< 平滑器离终点还剩多远（到位判据 / 超时日志用）
 	float _ground_z{0.f};             ///< 地面参考的 z（NED），在 WAIT 里落地时就锁存，作为降落目标
 	bool _ground_z_latched{false};    ///< 只在**还没起飞**时锁存一次；手动进场时进 Offboard 已经在空中了

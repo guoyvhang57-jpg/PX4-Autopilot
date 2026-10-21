@@ -144,6 +144,7 @@ set(msg_files
 	Mission.msg
 	MissionResult.msg
 	MountOrientation.msg
+	MyMissionAssist.msg
 	NavigatorMissionItem.msg
 	NavigatorStatus.msg
 	NeuralControl.msg

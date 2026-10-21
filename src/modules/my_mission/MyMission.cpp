@@ -82,6 +82,8 @@ const char *MyMission::stateName(State state)
 
 	case State::Hover:   return "HOVER";
 
+	case State::Return:  return "RETURN";
+
 	case State::Land:    return "LAND";
 
 	case State::Disarm:  return "DISARM";
@@ -193,6 +195,15 @@ TransitLeg::Limits MyMission::transitLimits() const
 void MyMission::enterTransit(const Tick &tick, State next)
 {
 	_transit.setLimits(transitLimits());
+	_transit_acc_along = 0.f;
+	_decel_timer = 0.f;
+
+	// 锁存中转航向的水平单位向量，用来把加速度投影成"带符号的沿航向分量"。
+	// 距离太近（< 0.5 m）时方向没有意义，退回起飞航向。
+	const matrix::Vector2f to_goal(_goal3(0) - tick.pos.x, _goal3(1) - tick.pos.y);
+	_transit_dir = (to_goal.norm() > 0.5f) ? to_goal.unit()
+		       : matrix::Vector2f(cosf(_takeoff_yaw), sinf(_takeoff_yaw));
+
 	_transit.start(_goal3, tick.pos);
 
 	enterState(next, tick.now);
@@ -201,6 +212,29 @@ void MyMission::enterTransit(const Tick &tick, State next)
 bool MyMission::advanceTransit(const Tick &tick)
 {
 	const TransitLeg::Update u = _transit.update(tick.pos, tick.dt);
+
+	// ---- 减速段判定 ----
+	// 沿航向的**有符号**加速度翻负并持续 0.2 s，就认为轨迹进入减速段。
+	// 单向闩锁：一段航程里减速之后不会再加速，所以没有退出条件，也就不会在零点抖。
+	// 闩锁之后 Run() 把前推力辅助关掉 —— 减速段姿态抬头，夹紧没有力可以交出去，
+	// 而减速过程中速度掉到参考以下时需求会短暂翻回低头，那一瞬间辅助会重新介入。
+	{
+		const matrix::Vector2f acc_xy(u.acceleration(0), u.acceleration(1));
+		_transit_acc_along = acc_xy.dot(_transit_dir);
+
+		if (!_decel_latched && (_transit_acc_along < -0.2f)) {
+			_decel_timer += tick.dt;
+
+			if (_decel_timer > 0.2f) {
+				_decel_latched = true;
+				PX4_INFO("my_mission: deceleration phase (a_along %.2f m/s^2), forward assist off",
+					 (double)_transit_acc_along);
+			}
+
+		} else if (_transit_acc_along >= -0.2f) {
+			_decel_timer = 0.f;
+		}
+	}
 
 	// 位置、速度、**加速度**三个量一起发。加速度这一项是修掉末端过冲的关键：
 	// PositionControl.cpp:153 把它直接加进加速度指令，绕过了速度环那个
@@ -317,12 +351,22 @@ void MyMission::Run()
 	//   c) WAIT / DONE 也可能正处在 Offboard 里（比如刚上锁还没切走），一样要续命。
 	publishControlMode(now);
 
+	// ---- 前推力辅助的阶段许可 ----
+	// 每拍都发（含 WAIT/DONE）：控制器用 500 ms 超时判活，断流会退回"允许"。
+	// 只在"需要往前加速"的时候开：
+	//   TILT     —— 整个拉绳段都要，这是它存在的意义
+	//   FORWARD  —— 加速段和巡航段要，**减速段关掉**（姿态抬头，没有力要交出去）
+	//   其余     —— RETURN 是空载回家，HOVER/LAND 更不需要，一律关
+	const bool assist_allowed = (_state == State::Tilt)
+				    || ((_state == State::Forward) && !_decel_latched);
+	_output.publishAssist(assist_allowed, now);
+
 	// ---- 2) 安全兜底 ----
 	// 只有"正在起飞 / 前飞 / 绳段 / 低头 / 悬停"时，掉出 Offboard 或上锁才算异常，
 	// 直接中止。LAND 阶段允许离开 Offboard —— 方式 1 的 AUTO_LAND 本来就会把
 	// nav_state 切走；DISARM / DONE 本来就已经落地或结束，不算异常。
 	if ((_state == State::Takeoff || _state == State::Forward
-	     || _state == State::Tilt || _state == State::Hover)
+	     || _state == State::Tilt || _state == State::Hover || _state == State::Return)
 	    && (!offboard || !armed.armed)) {
 		PX4_WARN("my_mission: abort (offboard=%d armed=%d)", (int)offboard, (int)armed.armed);
 		enterState(State::Done, now);
@@ -341,7 +385,7 @@ void MyMission::Run()
 
 	static constexpr Handler kHandlers[] = {
 		&MyMission::stateWait, &MyMission::stateTakeoff, &MyMission::stateForward,
-		&MyMission::stateTilt, &MyMission::stateHover,
+		&MyMission::stateTilt, &MyMission::stateHover, &MyMission::stateReturn,
 		&MyMission::stateLand, &MyMission::stateDisarm, &MyMission::stateDone,
 	};
 	static_assert(sizeof(kHandlers) / sizeof(kHandlers[0]) == int(State::Count), "state table out of sync");
@@ -387,16 +431,27 @@ void MyMission::stateWait(const Tick &tick)
 	if (tick.armed.armed && tick.offboard && tick.pos_valid) {
 		const matrix::Vector3f here(tick.pos.x, tick.pos.y, tick.pos.z);
 
-		// ---- 到 home 的三维距离 ----
-		// 用 PX4 的 home_position（**解锁那一刻**的位置），不是 EKF 本地原点：
-		//   原点在整机 EKF 重启之前不变，语义是"这次上电在哪"；
-		//   home 每次解锁都会重设，语义是"这一趟从哪起飞"，更贴近"手动飞出去多远"。
-		// home_position.x/y/z 本来就是本地系坐标，所以直接和当前位置相减。
-		// 没收到 / 无效时退回 EKF 原点，行为和不加这个功能时一致。
+		// ===============================================================
+		// 统一参考点：PX4 的 home_position，也就是**解锁那一刻**的位置
+		// ===============================================================
+		//    x/y —— TAKEOFF 的起飞点、FORWARD 的起点（MYM_FWD_DIST 从这里算）
+		//    z   —— 地面参考，MYM_LAND_MODE=0 的下降目标
+		//    距离 —— 手动进场的判据
+		//    RETURN 的目标 —— 同一组 x/y
+		//
+		// 这样整趟任务只有一个坐标原点到"地面上的哪个点"的映射，不会出现
+		// "起飞点飞出去、返航回解锁点"这种分叉。
+		// home_position.x/y/z 本来就是本地系坐标，直接拿来用，不用投影。
+		// home 无效（没解锁过 / 话题没来）时退回"当前位置 + 锁存的地面"，和原来一致。
 		home_position_s home{};
 		const bool home_valid = _home_position_sub.copy(&home) && home.valid_lpos;
-		const matrix::Vector3f home_pos = home_valid ? matrix::Vector3f(home.x, home.y, home.z)
-						  : matrix::Vector3f();
+		const matrix::Vector3f home_pos = home_valid
+						  ? matrix::Vector3f(home.x, home.y, home.z)
+						  : matrix::Vector3f(here(0), here(1),
+								  _ground_z_latched ? _ground_z : here(2));
+		_ground_z = home_pos(2);
+		_ground_z_latched = true;
+
 		const float dist_home = (here - home_pos).norm();
 
 		// 锁死这一刻的航向。_yaw_sp 是 holdCurrentPosition() 每拍从姿态里抄的，
@@ -414,24 +469,30 @@ void MyMission::stateWait(const Tick &tick)
 		// 一进 Offboard 就会坐在地上拉绳，会翻。
 		if (_config.rope_test && !tick.land.landed && (dist_home > _config.arrive)) {
 			// 三轴都用当前值：手动飞过来的高度就是拉绳高度，不套 MYM_ALT。
+			// （拉绳点就是飞手停的那个地方，这是唯一一个**有意**不以 home 为准的
+			//   位置 —— 它的定义就是"飞机现在在哪"。）
 			_target = here;
 			_target_valid = true;
 			_tilt_ff = 0.f;
 			_last_rope_log = 0;
 			enterState(State::Tilt, tick.now);
 			PX4_INFO("my_mission: manual entry %.2f m from %s (%.2f m above ground) -> PULL %.1f deg, %.1f s",
-				 (double)dist_home, home_valid ? "home" : "EKF origin",
+				 (double)dist_home, home_valid ? "home" : "current position",
 				 (double)(_ground_z - here(2)),
 				 (double)_config.pitch_down_deg, (double)_config.tilt_hold);
 
 		} else {
-			// 正常流程：从地面起飞。地面参考就是此刻的 z（这时还在原地/地上）。
-			_ground_z = tick.pos.z;
-			_ground_z_latched = true;
+			// 正常流程：在 home 正上方起飞，高度 = home 的地面 + MYM_ALT。
+			// 后面 FORWARD 的终点也是从这里的 _target 加出去的，所以它自动变成
+			// "从 home 往前走 MYM_FWD_DIST"。
+			_target(0) = home_pos(0);
+			_target(1) = home_pos(1);
 			_target(2) = _ground_z - _config.alt;
 
 			enterState(State::Takeoff, tick.now);
-			PX4_INFO("my_mission: TAKEOFF -> %.2f m (yaw %.0f deg)", (double)_config.alt,
+			PX4_INFO("my_mission: TAKEOFF at %s [%.2f %.2f] -> %.2f m (yaw %.0f deg)",
+				 home_valid ? "home" : "current position",
+				 (double)home_pos(0), (double)home_pos(1), (double)_config.alt,
 				 (double)math::degrees(_takeoff_yaw));
 		}
 	}
@@ -656,10 +717,95 @@ void MyMission::stateHover(const Tick &tick)
 	publishSetpoint(targetSetpoint(), tick.now);
 
 	if (elapsedSince(_state_start, tick.now) >= _config.hover) {
-		enterState(State::Land, tick.now);
-		_land_cmd_sent = false;   // 允许在 LAND 里发一次降落命令
-		PX4_INFO("my_mission: LAND (mode %d)", _config.land_mode);
+		// 悬停结束**不直接降落**：先飞回 home（解锁时设的那个点），到了再落。
+		// 高度取当前值 —— 回家是同高度平飞，不是降到地面。
+		home_position_s home{};
+		const bool home_valid = _home_position_sub.copy(&home) && home.valid_lpos;
+
+		if (home_valid) {
+			_home = matrix::Vector3f(home.x, home.y, tick.pos.z);
+			enterState(State::Return, tick.now);
+			PX4_INFO("my_mission: RETURN to home [%.2f %.2f] (%.1f m away), cruise %.2f m/s",
+				 (double)_home(0), (double)_home(1),
+				 (double)matrix::Vector2f(_home(0) - tick.pos.x, _home(1) - tick.pos.y).norm(),
+				 (double)_config.fwd_spd);
+
+		} else {
+			// 没有有效的 home（没解锁过 / home_position 没来）就地降落，别乱飞。
+			PX4_WARN("my_mission: no valid home position, landing here");
+			enterState(State::Land, tick.now);
+			_land_cmd_sent = false;
+		}
 	}
+}
+
+void MyMission::stateReturn(const Tick &tick)
+{
+	if (!_return_started) {
+		// ---- 第一步：原地把机头对准 home ----
+		// 不先转的话，回程是"侧着飞"——位置环照样能飞，但机头朝向和运动方向不一致，
+		// 视觉上很怪，而且真机上摄像头/空速管的方向也不对。
+		const matrix::Vector2f to_home(_home(0) - tick.pos.x, _home(1) - tick.pos.y);
+
+		if (to_home.norm() < 1.0f) {
+			// 已经在 home 正上方（或 1 m 以内），没有方向可言，直接开始
+			_startReturnTransit(tick);
+			return;
+		}
+
+		_yaw_sp = atan2f(to_home(1), to_home(0));
+		_target = matrix::Vector3f(tick.pos.x, tick.pos.y, tick.pos.z);
+		publishSetpoint(targetSetpoint(), tick.now);
+
+		const float yaw_now = matrix::Eulerf(matrix::Quatf(tick.att.q)).psi();
+
+		if (fabsf(matrix::wrap_pi(_yaw_sp - yaw_now)) < math::radians(5.f)) {
+			_startReturnTransit(tick);
+
+		} else if (elapsedSince(_state_start, tick.now) > _config.fwd_tmo) {
+			// 转不过去（这个场景不该发生，但绝不能卡在 RETURN 里不出来）
+			PX4_WARN("my_mission: yaw alignment timeout, landing here");
+			enterState(State::Land, tick.now);
+			_land_cmd_sent = false;
+		}
+
+		return;
+	}
+
+	if (advanceTransit(tick)) {
+		_target = _goal3;
+		enterState(State::Land, tick.now);
+		_land_cmd_sent = false;
+		PX4_INFO("my_mission: home reached [%.2f %.2f], LAND (mode %d)",
+			 (double)_goal3(0), (double)_goal3(1), _config.land_mode);
+
+	} else if (elapsedSince(_state_start, tick.now) > _config.fwd_tmo) {
+		// 飞不回去（顶风 / 航向歪 / 位置估计漂）也不能一直在外面转：
+		// 就地降落，降落本身是保底功能。
+		PX4_WARN("my_mission: return timeout (traj %.2f m from home), landing here", (double)_goal_distance);
+		enterState(State::Land, tick.now);
+		_land_cmd_sent = false;
+	}
+}
+
+void MyMission::_startReturnTransit(const Tick &tick)
+{
+	_goal3 = _home;
+
+	// 和 enterTransit() 做同样的事，但**不能**调它：它会 enterState()，
+	// 而那会把 _return_started 清掉，退回"对准航向"那一步。
+	_transit.setLimits(transitLimits());
+	_transit_acc_along = 0.f;
+	_decel_timer = 0.f;
+
+	const matrix::Vector2f to_goal(_goal3(0) - tick.pos.x, _goal3(1) - tick.pos.y);
+	_transit_dir = (to_goal.norm() > 0.5f) ? to_goal.unit()
+		       : matrix::Vector2f(cosf(_yaw_sp), sinf(_yaw_sp));
+
+	_transit.start(_goal3, tick.pos);
+	_return_started = true;
+	PX4_INFO("my_mission: heading home, %.1f m to go",
+		 (double)(_goal3 - matrix::Vector3f(tick.pos.x, tick.pos.y, tick.pos.z)).norm());
 }
 
 void MyMission::stateLand(const Tick &tick)
