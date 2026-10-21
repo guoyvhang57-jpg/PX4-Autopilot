@@ -557,6 +557,17 @@ void MyMission::stateTilt(const Tick &tick)
 		_tilt_ff = math::max(_tilt_ff - a_step, a_target);
 	}
 
+	// ---- 水平目标跟着飞机走 ----
+	// 不跟的话位置环会把"低头把飞机推出去"的那段位移当成跟踪误差，反过来把前馈
+	// 抵消掉：实测 a_ff = 1.73 m/s² 时，控制器输出的 acc_sp 只剩 0.05~0.14，
+	// 姿态停在 0.2 度（本来要 10 度），飞机只有 0.8 m 的漂移就稳住了。
+	// 跟着走之后位置误差≈0，需求就只剩下面前馈；速度环仍然把水平速度压到 0，
+	// 所以飞机不会一直往前爬。
+	//
+	// z **不跟**：高度靠位置环维持，跟着走等于放弃高度控制。
+	_target(0) = tick.pos.x;
+	_target(1) = tick.pos.y;
+
 	// 沿起飞航向的加速度前馈；z 给 NaN = 不做前馈，让位置环自己维持高度。
 	MissionOutput::Setpoint setpoint = targetSetpoint();
 	setpoint.acceleration = matrix::Vector3f(_tilt_ff * cosf(_takeoff_yaw), _tilt_ff * sinf(_takeoff_yaw), NAN);
