@@ -32,11 +32,10 @@
  *   MissionOutput.{...}   所有出站 topic（offboard_control_mode / trajectory_setpoint /
  *                         vehicle_command）。**只有它能发 topic。**
  *   TransitLeg.{...}      "用 PX4 的轨迹生成器飞到一个定点"，FORWARD 和 ROPE 共用。
- *   RopeGeometry.{...}    系绳几何，纯函数，不碰 uORB/参数。
  *   ExternalParams.{...}  从别人的参数（MPC_* / MAN_DEADZONE / LNDMC_Z_VEL_MAX）抄阈值。
  *   TakeoverMonitor.{...} 接管安全：飞出 Offboard 时油门没回中会掉高度。
  *
- * 依赖方向是单向的：MyMission → 其它，其它之间互不依赖（RopeGeometry 谁也不依赖）。
+ * 依赖方向是单向的：MyMission → 其它，其它之间互不依赖。
  *
  * ===========================================================================
  * 类的形状（三个基类，顺序别改）
@@ -69,7 +68,6 @@
 #include "ExternalParams.hpp"
 #include "MissionConfig.hpp"
 #include "MissionOutput.hpp"
-#include "RopeGeometry.hpp"
 #include "TakeoverMonitor.hpp"
 #include "TransitLeg.hpp"
 
@@ -100,8 +98,8 @@ private:
 	enum class State {
 		Wait,     ///< 等 armed + Offboard + 位置有效；setpoint 钉在当前位置
 		Takeoff,  ///< 目标 = 地面参考上方 MYM_ALT，等位置/速度都到位
-		Forward,  ///< 用 TransitLeg 飞到**唯一的目的地**：开了绳是绷紧点，否则是前方点
-		Tilt,     ///< 停在绷紧点，按 MYR_PITCH_DOWN 低头，高度不变；保持 MYM_HOVER 秒
+		Forward,  ///< 用 TransitLeg 飞到前方点（MYM_FWD_DIST / MYM_FWD_DIR）
+		Tilt,     ///< 拉绳：目标留在起飞点，按 MYR_PITCH_DOWN / MYR_FWD_THR 发前馈，保持 MYR_TILT_HOLD 秒
 		Hover,    ///< 保持同一 setpoint MYM_HOVER 秒
 		Land,     ///< 方式 1：发 NAV_LAND 交 AUTO_LAND；方式 0：自己把 z 斜坡拉回地面
 		Disarm,   ///< 发 COMPONENT_ARM_DISARM(param1=0)，1 Hz 重试直到 !armed
@@ -152,7 +150,6 @@ private:
 	bool advanceTransit(const Tick &tick);   ///< 推进一拍并发布，返回"到位"
 
 	// ---- 系绳测试 ----
-	void solveRope();                        ///< 按当前参数把锚点/绷紧点解出来
 	void logTransitStart(const Tick &tick);
 
 	// ---- 每拍 / 事件驱动的杂项 ----
@@ -177,11 +174,9 @@ private:
 	TransitLeg _transit;
 	ExternalParams _external;
 	TakeoverMonitor _takeover;
-	RopeGeometry _rope;
 
 	// ---- 配置快照 / 解出来的几何 ----
 	MissionConfig _config;            ///< 每拍从参数刷新的只读快照
-	RopeSolution _rope_solution;      ///< 进 ROPE 时解一次，之后不再变
 
 	// ---- 任务记忆（9 个状态共享，所以留在主类）----
 	State _state{State::Wait};
@@ -194,7 +189,6 @@ private:
 	bool _target_valid{false};        ///< false 时 trajectory_setpoint 的位置发 NaN
 	matrix::Vector3f _target{};       ///< 位置环目标，机体系无关的本地 NED 坐标
 	matrix::Vector3f _goal3{};        ///< 中转目标（三维 NED）
-	bool _rope_leg{false};            ///< 本次中转飞的是绷紧点（TAKEOFF 到位时闩锁，之后不再看参数）
 	float _goal_distance{0.f};        ///< 平滑器离终点还剩多远（到位判据 / 超时日志用）
 	float _ground_z{0.f};             ///< 进入 Offboard 时的 z（NED），作为降落的目标地面高度
 	float _yaw_sp{0.f};               ///< 锁存的航向，每拍原样发给 trajectory_setpoint.yaw
@@ -233,11 +227,7 @@ private:
 		(ParamFloat<px4::params::MYM_LAND_TMO>) _param_mym_land_tmo,
 		(ParamInt<px4::params::MYM_AUTO_DISARM>) _param_mym_auto_disarm,
 		(ParamFloat<px4::params::MYM_DISARM_TMO>) _param_mym_disarm_tmo,
-		(ParamFloat<px4::params::MYR_ANCHOR_X>) _param_myr_anchor_x,
-		(ParamFloat<px4::params::MYR_ANCHOR_Y>) _param_myr_anchor_y,
-		(ParamFloat<px4::params::MYR_ANCHOR_Z>) _param_myr_anchor_z,
-		(ParamFloat<px4::params::MYR_ROPE_LEN>) _param_myr_rope_len,
-		(ParamFloat<px4::params::MYR_ROPE_ANGLE>) _param_myr_rope_angle,
+		(ParamInt<px4::params::MYR_ROPE_EN>) _param_myr_rope_en,
 		(ParamFloat<px4::params::MYR_PITCH_DOWN>) _param_myr_pitch_down,
 		(ParamFloat<px4::params::MYR_TILT_HOLD>) _param_myr_tilt_hold,
 		(ParamFloat<px4::params::MYR_FWD_THR>) _param_myr_fwd_thr

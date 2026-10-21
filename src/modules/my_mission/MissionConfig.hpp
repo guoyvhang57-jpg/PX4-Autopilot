@@ -24,7 +24,7 @@
  * 本模块**自己的**参数（MYM_* / MYR_*）的一份只读快照。
  *
  * 为什么要有这一层：
- *   - 子组件（TransitLeg / RopeGeometry）不想依赖 ModuleParams；
+ *   - 子组件（TransitLeg）不想依赖 ModuleParams；
  *   - 每拍从 ParamFloat 里逐个 .get() 会有 20 次原子读，
  *     快照成 POD 之后状态机里全是普通结构体访问，读起来也干净；
  *   - 参数热更新天然成立 —— 主类在 parameter_update 时重新填一遍。
@@ -35,7 +35,6 @@
 
 #pragma once
 
-#include "RopeGeometry.hpp"
 
 struct MissionConfig {
 	// ---- MYM_*：任务流程 ----
@@ -44,8 +43,8 @@ struct MissionConfig {
 	float fwd_dir_deg{0.f};   ///< MYM_FWD_DIR 前飞方向相对机头的偏角 [deg]
 	float fwd_spd{0.5f};      ///< MYM_FWD_SPD 中转巡航速度 [m/s]
 	float fwd_acc{1.f};       ///< MYM_FWD_ACC 中转加减速度上限 [m/s^2]
-	float fwd_tmo{20.f};      ///< MYM_FWD_TMO 中转超时 [s]（FORWARD 和 ROPE 共用）
-	float hover{5.f};         ///< MYM_HOVER 悬停 / TILT 保持时间 [s]
+	float fwd_tmo{20.f};      ///< MYM_FWD_TMO 中转超时 [s]
+	float hover{5.f};         ///< MYM_HOVER 悬停时间 [s]
 	int land_mode{1};         ///< MYM_LAND_MODE 0 = Offboard 下降，1 = AUTO_LAND
 	float desc_rate{0.4f};    ///< MYM_DESC_RATE Offboard 下降速率 [m/s]
 	float arrive{0.2f};       ///< MYM_ARRIVE 到位判定半径 [m]
@@ -55,11 +54,9 @@ struct MissionConfig {
 	float disarm_tmo{10.f};   ///< MYM_DISARM_TMO 上锁超时 [s]
 
 	// ---- MYR_*：系绳测试 ----
-	RopeConfig rope{};           ///< MYR_ANCHOR_{X,Y,Z} / MYR_ROPE_LEN / MYR_ROPE_ANGLE
-	float pitch_down_deg{15.f};  ///< MYR_PITCH_DOWN 绷紧点上的低头角 [deg]
-	float tilt_hold{10.f};       ///< MYR_TILT_HOLD 绷紧点上低头保持多久 [s]
+	bool rope_test{false};       ///< MYR_ROPE_EN 拉绳测试开关；纯开关，不算几何
+	float pitch_down_deg{15.f};  ///< MYR_PITCH_DOWN 拉绳时的低头角 [deg]
+	float tilt_hold{10.f};       ///< MYR_TILT_HOLD 拉绳保持多久 [s]
 	float fwd_thr{0.f};         ///< MYR_FWD_THR 前推力电机归一化油门；> 0 时姿态钉在低头上限
 
-	/// 是否启用系绳段（MYR_ROPE_LEN > 0）
-	bool ropeEnabled() const { return rope.rope_length > 0.f; }
 };

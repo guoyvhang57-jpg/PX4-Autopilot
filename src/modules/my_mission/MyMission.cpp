@@ -165,10 +165,7 @@ void MyMission::refreshConfig()
 	_config.auto_disarm = (_param_mym_auto_disarm.get() != 0);
 	_config.disarm_tmo = _param_mym_disarm_tmo.get();
 
-	_config.rope.anchor_offset_body = matrix::Vector3f(_param_myr_anchor_x.get(), _param_myr_anchor_y.get(),
-					  _param_myr_anchor_z.get());
-	_config.rope.rope_length = _param_myr_rope_len.get();
-	_config.rope.rope_angle_deg = _param_myr_rope_angle.get();
+	_config.rope_test = (_param_myr_rope_en.get() != 0);
 	_config.pitch_down_deg = _param_myr_pitch_down.get();
 	_config.tilt_hold = _param_myr_tilt_hold.get();
 	_config.fwd_thr = _param_myr_fwd_thr.get();
@@ -232,42 +229,16 @@ bool MyMission::advanceTransit(const Tick &tick)
 // ===========================================================================
 // 系绳测试
 // ===========================================================================
-void MyMission::solveRope()
-{
-	// 几何一次算定：只依赖 **EKF 本地原点**、起飞航向和 MYR_*，之后不再变。
-	//
-	// 基准是原点 (0,0,0)，**不是起飞点**。这一点很关键：绳子的锚点是地面上
-	// 一个固定的点，不该随飞机走。用起飞点做基准的话，落一次地再重新解锁，
-	// 锚点就跟着落点跑了，而仿真里的绳还拴在出生点 —— 第二趟就会算到一个
-	// 错误的绷紧点（表现：飞到了却不低头）。用原点之后，同一个上电会话里
-	// 跑多少趟，锚点都不变。
-	//
-	// EKF 本地原点 = 拿到第一个有效位置估计的那个点，仿真里就是模型的出生点，
-	// 真机上就是上电时飞机所在的位置 —— 所以现场要把飞机摆在系绳桩附近再上电。
-	_rope.setConfig(_config.rope);
-	_rope_solution = _rope.solve(matrix::Vector3f(), _takeoff_yaw);
-}
-
 void MyMission::logTransitStart(const Tick &tick)
 {
-	// 目的地只有一个，"是哪一种"由 _rope_leg 决定（TAKEOFF 到位时闩锁的）。
 	const matrix::Vector3f here(tick.pos.x, tick.pos.y, tick.pos.z);
 	const float dist = (_goal3 - here).norm();
 	const float climb = tick.pos.z - _goal3(2);   // NED：正 = 要往上爬
 	const float t_est = TransitLeg::estimateDuration(dist, _config.fwd_spd, _config.fwd_acc);
 
-	if (_rope_leg) {
-		PX4_INFO("my_mission: FORWARD -> taut point [%.2f %.2f %.2f], anchor [%.2f %.2f %.2f] (rope %.1f m at %.0f deg)",
-			 (double)_goal3(0), (double)_goal3(1), (double)_goal3(2),
-			 (double)_rope_solution.anchor(0), (double)_rope_solution.anchor(1),
-			 (double)_rope_solution.anchor(2),
-			 (double)_config.rope.rope_length, (double)_config.rope.rope_angle_deg);
-
-	} else {
-		PX4_INFO("my_mission: FORWARD %.2f m at %.0f deg (heading %.0f deg) -> target [%.2f %.2f]",
-			 (double)_config.fwd_dist, (double)_config.fwd_dir_deg,
-			 (double)math::degrees(_takeoff_yaw), (double)_goal3(0), (double)_goal3(1));
-	}
+	PX4_INFO("my_mission: FORWARD %.2f m at %.0f deg (heading %.0f deg) -> target [%.2f %.2f]",
+		 (double)_config.fwd_dist, (double)_config.fwd_dir_deg,
+		 (double)math::degrees(_takeoff_yaw), (double)_goal3(0), (double)_goal3(1));
 
 	PX4_INFO("my_mission: %.1f m to go (climb %.1f m), cruise %.2f m/s acc %.2f m/s^2 jerk %.2f, "
 		 "est %.1f s (tilt ~%.0f deg)",
@@ -275,8 +246,6 @@ void MyMission::logTransitStart(const Tick &tick)
 		 (double)_external.mpcJerkAuto(), (double)t_est,
 		 (double)math::degrees(atanf(_config.fwd_acc / CONSTANTS_ONE_G)));
 
-	// 飞绷紧点时这段比前飞长得多（水平 L*cosθ + 竖直 L*sinθ），MYM_FWD_TMO 沿用
-	// 前飞那个值时很容易半路超时 —— 超时会直接转降落，看起来像"绳子还没拉紧就下来了"。
 	if (t_est > _config.fwd_tmo) {
 		PX4_WARN("my_mission: est %.1f s > MYM_FWD_TMO %.1f s -> will time out; "
 			 "raise MYM_FWD_TMO or MYM_FWD_SPD", (double)t_est, (double)_config.fwd_tmo);
@@ -431,20 +400,19 @@ void MyMission::stateTakeoff(const Tick &tick)
 
 	if (reachedTarget(tick.pos)) {
 		// ===============================================================
-		// 目的地只有一个，二选一，**在 TAKEOFF 到位这一刻定死**
+		// TAKEOFF 到位后二选一
 		// ===============================================================
-		// 开了绳  -> 绷紧点（斜距正好 = MYR_ROPE_LEN 的那个位置）
-		// 没开绳  -> 前方点（MYM_FWD_DIST / MYM_FWD_DIR）
-		// 两个都配了也是二选一：**绳优先**，MYM_FWD_DIST / MYM_FWD_DIR 失效。
-		//
-		// 结果连同"飞的是哪种"一起闩锁进 _rope_leg：到达时的动作必须和
-		// "出发时选的目的地"一致，不能等到落地前再去看参数 —— 否则飞到一半
-		// 把 MYR_ROPE_LEN 改成 0，飞机会在前飞点上开始低头。
-		_rope_leg = _config.ropeEnabled();
-
-		if (_rope_leg) {
-			solveRope();
-			_goal3 = _rope_solution.taut;
+		// 开绳   -> **直接进 TILT**。绳在起飞那一刻就已经绷紧（或几乎绷紧），
+		//           没有什么"绷紧点"要算、也不需要先飞一段。目标留在起飞点上空，
+		//           由位置环维持；TILT 只负责发沿航向的加速度前馈。
+		// 没开绳 -> FORWARD：飞 MYM_FWD_DIST，到位后 HOVER。
+		if (_config.rope_test) {
+			_tilt_ff = 0.f;
+			_last_rope_log = 0;
+			enterState(State::Tilt, tick.now);
+			PX4_INFO("my_mission: rope test -> TILT %.1f deg for %.1f s (thr %.0f%%), no transit",
+				 (double)_config.pitch_down_deg, (double)_config.tilt_hold,
+				 (double)(_config.fwd_thr * 100.f));
 
 		} else if (_config.fwd_dist > 0.f) {
 			// ===========================================================
@@ -466,9 +434,7 @@ void MyMission::stateTakeoff(const Tick &tick)
 			_goal3(0) = _target(0) + _config.fwd_dist * cosf(psi);
 			_goal3(1) = _target(1) + _config.fwd_dist * sinf(psi);
 			_goal3(2) = _target(2);   // z 不动：先在 MYM_ALT 上平飞过去
-		}
 
-		if (_rope_leg || (_config.fwd_dist > 0.f)) {
 			enterTransit(tick, State::Forward);
 			logTransitStart(tick);
 
@@ -497,23 +463,9 @@ void MyMission::stateForward(const Tick &tick)
 		// 钉到终点之后，下一个状态的位置环会把剩下那点走完。
 		_target = _goal3;
 
-		if (_rope_leg) {
-			// 到的是绷紧点：绳已经绷直，接着低头（MYR_PITCH_DOWN = 0 时等于原地悬停，
-			// a_ff 为 0，TILT 照常保持 MYM_HOVER 秒再降落）。
-			enterState(State::Tilt, tick.now);
-			_last_rope_log = 0;
-			_tilt_ff = 0.f;   // 从 0 开始爬
-			PX4_INFO("my_mission: taut point reached [%.2f %.2f %.2f] (slant %.2f m), TILT %.1f deg down",
-				 (double)_goal3(0), (double)_goal3(1), (double)_goal3(2),
-				 (double)RopeGeometry::slant(_rope_solution.anchor, _goal3),
-				 (double)_config.pitch_down_deg);
-
-		} else {
-			// 到的是前方点：和以前一样悬停 MYM_HOVER 秒再降落。
-			enterState(State::Hover, tick.now);
-			PX4_INFO("my_mission: reached forward point [%.2f %.2f], HOVER %.1f s",
-				 (double)_goal3(0), (double)_goal3(1), (double)_config.hover);
-		}
+		enterState(State::Hover, tick.now);
+		PX4_INFO("my_mission: reached forward point [%.2f %.2f], HOVER %.1f s",
+			 (double)_goal3(0), (double)_goal3(1), (double)_config.hover);
 
 	} else if (elapsedSince(_state_start, tick.now) > _config.fwd_tmo) {
 		// 飞不到（航向估计歪 / 顶风 / EKF 位置漂 / 限幅设得太小）→ 不再硬追，
@@ -547,11 +499,10 @@ void MyMission::stateTilt(const Tick &tick)
 	// φ = 20° 时 T_rope ≈ 14.6 N（不含推力电机），φ = 30° 时 ≈ 23.1 N。
 	// 插件的张力上限现在是 1000 N（按真绳承载给），这个量级连边都摸不到，
 	// 所以实际约束不是上限而是 <stiffness>（3000 N/m：1 N 对应 0.33 mm 伸长）。
-	// 这一段不含推力电机：位置误差≈0，前推力辅助没有"缺额"可用，
-	// 所以两个推进电机在这个状态下是停着的。
-	//
-	// 实测会差 1~2 度（MYR_PITCH_DOWN=15 得到 13.5）：速度环积分器在 FORWARD 段（飞绷紧点那一趟）
-	// 末端的扰动里留下一点残余（约 -0.27 m/s²），把总加速度从 2.63 拉到 2.35。
+	// 巡航段以前实测会差 1~2 度（MYR_PITCH_DOWN=15 得到 13.5），原因是速度环
+	// 积分器在前一段飞行的扰动里留了一点残余（约 -0.27 m/s²）。现在 TILT 直接接在
+	// TAKEOFF 之后、没有中转段，这个残余应该小得多；`MYR_FWD_THR` 那一路也会
+	// 吃掉一部分残差。
 	float pitch_down = math::constrain(_config.pitch_down_deg, -_external.mpcTiltmaxAir(), _external.mpcTiltmaxAir());
 
 	if ((fabsf(pitch_down - _config.pitch_down_deg) > 0.01f) && !_pitch_clamped_warned) {
@@ -621,10 +572,9 @@ void MyMission::stateTilt(const Tick &tick)
 		// 实际俯仰角。Eulerf 的 theta 正 = 抬头，所以"低头角"要取负。
 		const float pitch_real = -math::degrees(matrix::Eulerf(matrix::Quatf(tick.att.q)).theta());
 
-		PX4_INFO("my_mission: TILT demand %.1f deg (a_ff %.2f, thr %.0f%%), actual %.1f deg, slant %.2f m, rope angle %.1f deg",
+		PX4_INFO("my_mission: TILT demand %.1f deg (a_ff %.2f, thr %.0f%%), actual %.1f deg, alt %.2f m",
 			 (double)pitch_used, (double)_tilt_ff, (double)(thr * 100.f), (double)pitch_real,
-			 (double)RopeGeometry::slant(_rope_solution.anchor, here),
-			 (double)RopeGeometry::angleDeg(_rope_solution.anchor, here));
+			 (double)(-here(2)));
 	}
 
 	// 保持时间用 MYR_TILT_HOLD，**不是 MYM_HOVER** —— 低头保持多久和
@@ -811,17 +761,13 @@ int MyMission::print_status()
 	_local_pos_sub.copy(&local_pos);
 	const matrix::Vector3f here(local_pos.x, local_pos.y, local_pos.z);
 
-	if (_config.ropeEnabled()) {
-		PX4_INFO("rope %.1f m at %.1f deg  pitch_down %.1f deg",
-			 (double)_config.rope.rope_length, (double)_config.rope.rope_angle_deg,
-			 (double)_config.pitch_down_deg);
-		PX4_INFO("  anchor [%.2f %.2f %.2f]  taut [%.2f %.2f %.2f]  slant %.2f m",
-			 (double)_rope_solution.anchor(0), (double)_rope_solution.anchor(1), (double)_rope_solution.anchor(2),
-			 (double)_rope_solution.taut(0), (double)_rope_solution.taut(1), (double)_rope_solution.taut(2),
-			 (double)RopeGeometry::slant(_rope_solution.anchor, here));
+	if (_config.rope_test) {
+		PX4_INFO("rope test ON: pitch_down %.1f deg, hold %.1f s, thr %.0f%%",
+			 (double)_config.pitch_down_deg, (double)_config.tilt_hold,
+			 (double)(_config.fwd_thr * 100.f));
 
 	} else {
-		PX4_INFO("rope disabled (MYR_ROPE_LEN = 0)");
+		PX4_INFO("rope test OFF (MYR_ROPE_EN = 0)");
 	}
 
 	// 接管安全：现在把模式开关拨出 Offboard 会不会掉高度？
@@ -851,25 +797,19 @@ int MyMission::print_usage(const char *reason)
 Offboard position-control mission demo for a multicopter:
 
   WAIT (armed + Offboard) -> TAKEOFF (MYM_ALT)
-  -> FORWARD (one destination, chosen when the takeoff completes:
-                rope on  -> the point where a MYR_ROPE_LEN rope at MYR_ROPE_ANGLE
-                            is just taut; MYM_FWD_DIST / MYM_FWD_DIR are ignored
-                rope off -> MYM_FWD_DIST along the takeoff heading, offset by
-                            MYM_FWD_DIR
-              skipped when neither is configured)
-  -> TILT (rope destination only: hold the taut point and pitch MYR_PITCH_DOWN
-     degrees nose down for MYR_TILT_HOLD seconds, altitude unchanged)
-  -> HOVER (MYM_HOVER, forward destination and no-destination cases)
+  -> TILT (MYR_ROPE_EN = 1: go straight from the take-off point, pitch
+           MYR_PITCH_DOWN nose down for MYR_TILT_HOLD seconds and add
+           MYR_FWD_THR to the forward thrusters; no transit, no geometry)
+     or FORWARD (MYR_ROPE_EN = 0 and MYM_FWD_DIST > 0: fly MYM_FWD_DIST along
+           the take-off heading, offset by MYM_FWD_DIR)
+  -> HOVER (MYM_HOVER)
   -> LAND (offboard descent or PX4 AUTO_LAND) -> DISARM -> DONE
 
-The rope geometry is solved once, when the takeoff completes. The anchor is
-MYR_ANCHOR_{X,Y,Z} from the local origin -- not from the takeoff point, so that
-landing and re-arming does not drag the anchor along with the vehicle -- in the
-level body frame (forward / right / down, so MYR_ANCHOR_Z is positive
-downwards). The taut point sits MYR_ROPE_LEN*cos(MYR_ROPE_ANGLE) ahead of it
-along the takeoff heading and MYR_ROPE_LEN*sin(MYR_ROPE_ANGLE) above it. The
-destination type is latched with it -- changing MYR_ROPE_LEN in flight does not
-change where this run goes.
+MYR_ROPE_EN is a plain switch. The mission does not model the rope at all: the
+rope itself lives in the simulator (SDF <rope_length>/<anchor_offset>/
+<stiffness>, or GZ_TETHER_LEN), and the test is set up so that it is already
+taut when the vehicle reaches MYM_ALT. All the mission does is hold the
+take-off point and feed a horizontal acceleration forward.
 
 TILT is realised as an acceleration feedforward of g*tan(MYR_PITCH_DOWN) along
 the takeoff heading; the rope holds the vehicle back, so the resulting attitude

@@ -42,8 +42,6 @@ px4_add_module(
 		MissionConfig.hpp
 		MissionOutput.cpp
 		MissionOutput.hpp
-		RopeGeometry.cpp
-		RopeGeometry.hpp
 		TakeoverMonitor.cpp
 		TakeoverMonitor.hpp
 		TransitLeg.cpp

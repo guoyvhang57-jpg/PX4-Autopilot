@@ -102,13 +102,11 @@ _in_descend = PX4_ISFINITE(tsp.velocity[2]) && (tsp.velocity[2] >= 1.1f * LNDMC_
 
 ```
 WAIT ──arm + 进 Offboard──> TAKEOFF ──到达 MYM_ALT──>
-       目的地 = 绳 ? 绷紧点 : 前方点
-       ├─ 有目的地 ──> FORWARD ──到位──> 绳 ? TILT ──MYR_TILT_HOLD 秒──> : HOVER
-       └─ 没目的地 ─────────────────────> HOVER
+       ├─ MYR_ROPE_EN = 1 ──> TILT ──MYR_TILT_HOLD 秒──> HOVER
+       ├─ MYM_FWD_DIST > 0 ──> FORWARD ──到位──────────> HOVER
+       └─ 都没有 ────────────────────────────────────> HOVER
      ──MYM_HOVER 秒──> LAND ──> DISARM ──> DONE ──(已上锁)──> WAIT（可以再跑一遍）
 ```
-
-`TILT` 只在"目的地是绷紧点"时进；其余情况到位后照旧 `HOVER`。
 
 各状态的细节见 `README.md` 的"状态机"一节。
 
