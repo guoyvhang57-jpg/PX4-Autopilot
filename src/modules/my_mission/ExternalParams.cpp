@@ -24,6 +24,8 @@
 
 #include "ExternalParams.hpp"
 
+#include <px4_platform_common/defines.h>   // PX4_OK（SITL 那边由别的头间接带进来，NuttX 没有）
+
 void ExternalParams::refresh()
 {
 	for (auto &mirror : _mirrors) {
