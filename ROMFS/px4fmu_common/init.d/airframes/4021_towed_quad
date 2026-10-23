@@ -8,10 +8,13 @@
 # @maintainer TODO
 #
 # ===========================================================================
-# 当前档位：**只启用 4 个升力旋翼**（和真机现状一致，5/6 路还没接线/标定）
-#   下面"6 旋翼"整段是注释状态：CA_ROTOR4/5_*、FUNC5/6=105/106、CT4/5。
-#   5/6 路用 FUNC=1(Constant_Min) 停用 —— 和真机日志 log100.ulg 完全一致。
-#   等推力电调接好、行程标定完，把那段整体打开，并把 CA_ROTOR_COUNT 改成 6。
+# 当前档位：**6 旋翼全部启用**（4 个升力 + 2 个前向推力）
+#   推力电调的接线/行程检查完再解锁；第一次务必拆桨用 actuator_test 验证方向和
+#   映射，装桨后先系留。
+#
+#   ⚠ 仍然待实测的两项：
+#       CA_ROTOR4/5_CT   推力桨满油门推力的真实值（现在沿用升力桨的 21.6 N）
+#       PWM_MAIN_MIN5/6/MAX5/6  推力电调的行程（现在沿用 1100/1900）
 # ===========================================================================
 #
 # 坐标系：CA_ROTORn_PX/PY/PZ 用 FRD（x 前 / y 右 / z 下），单位 m，相对重心。
@@ -28,9 +31,11 @@
 
 # ---------------------------------------------------------------------------
 # 控制分配：4 个升力旋翼（推力轴朝上 (0,0,-1)，用 CA_ROTORn 默认 AX/AY/AZ）
+#
+# ⚠ CA_ROTOR_COUNT 统一在下面"2 个前向推力旋翼"那一段第一次给出（= 6）。
+#   param set-default 只认**第一次**写入，在这里先写 4 的话后面改成 6 不生效。
 # ---------------------------------------------------------------------------
 param set-default CA_AIRFRAME 0
-param set-default CA_ROTOR_COUNT 4
 
 param set-default CA_ROTOR0_PX  0.29898    # 右前 ccw
 param set-default CA_ROTOR0_PY  0.33634
@@ -66,8 +71,6 @@ param set-default PWM_MAIN_FUNC1 101
 param set-default PWM_MAIN_FUNC2 102
 param set-default PWM_MAIN_FUNC3 103
 param set-default PWM_MAIN_FUNC4 104
-param set-default PWM_MAIN_FUNC5 1
-param set-default PWM_MAIN_FUNC6 1
 
 param set-default PWM_MAIN_MIN1 1100
 param set-default PWM_MAIN_MIN2 1100
@@ -81,41 +84,70 @@ param set-default PWM_MAIN_MAX3 1900
 param set-default PWM_MAIN_MAX4 1900
 
 # ===========================================================================
-# ↓↓↓ 6 旋翼（2 个前向推力旋翼）—— 接线 + 台架标定完再整体打开 ↓↓↓
 # ===========================================================================
-# param set-default CA_ROTOR_COUNT 6
+# 2 个前向推力旋翼（旋翼 5/6）
 #
-# --- 前向推力旋翼：+70° 安装角，推力轴 = 前 0.940 / 上 0.342（FRD 下 AZ 为负）---
-# PZ = -0.283：推力线在重心上方 0.283 m，分配器据此自动配平抬头力矩，必须填对
-# PY = 0      ：故意不告诉它力臂，避免分配器用这两路做偏航（要差动偏航再改 ±0.55）
-# param set-default CA_ROTOR4_PX  0
-# param set-default CA_ROTOR4_PY  0
-# param set-default CA_ROTOR4_PZ -0.283
-# param set-default CA_ROTOR4_AX  0.940
-# param set-default CA_ROTOR4_AY  0
-# param set-default CA_ROTOR4_AZ -0.342
-# param set-default CA_ROTOR4_KM  0
-# param set-default CA_ROTOR5_PX  0
-# param set-default CA_ROTOR5_PY  0
-# param set-default CA_ROTOR5_PZ -0.283
-# param set-default CA_ROTOR5_AX  0.940
-# param set-default CA_ROTOR5_AY  0
-# param set-default CA_ROTOR5_AZ -0.342
-# param set-default CA_ROTOR5_KM  0
+# --- 推力轴：+70° 安装角 -> 前 0.940 / 上 0.342（FRD 的 z 向下，所以 AZ = -0.342）---
 #
-# --- 推力桨 CT：和升力桨的桨/电机不同就分别实测填写 ---
-# param set-default CA_ROTOR4_CT 21.6
-# param set-default CA_ROTOR5_CT 21.6
+# PZ = -0.05：推力线在**重心上方 0.05 m**（实测）。
+#   分配器会按这个力臂自动配平俯仰力矩，填错就等于凭空给飞机一个姿态偏差。
+#   满推时低头力矩 = 21.6 x 2 x 0.05 = 2.2 N·m，而升力桨俯仰权限是
+#   2 x 0.29898 x 21.6 = 12.9 N·m，占 17% —— 有足够余量。
+#   （旧文档里的 -0.283 是模型上的旧值，会让力矩占掉 89%，早已不适用。）
 #
-# --- 输出：先把上面 FUNC5/6 = 1 那两行删掉，再启用下面这些 ---
-# ⚠ 5/6 的行程必须单独标定，不能照抄升力桨的 1100/1900（日志里那组 900/1900 是停用值）
-# param set-default PWM_MAIN_FUNC5 105
-# param set-default PWM_MAIN_FUNC6 106
-# param set-default PWM_MAIN_MIN5 1100
-# param set-default PWM_MAIN_MIN6 1100
-# param set-default PWM_MAIN_MAX5 1900
-# param set-default PWM_MAIN_MAX6 1900
+# PY = 0：**必须为 0**，这不是可选项。
+#   推力轴是前向的，所以 y 向力臂直接给出偏航权限：偏航力矩 = -PY * AX * CT * u。
+#   实测 PY = 1.4 时单桨偏航权限 28.4 N·m，是 4 个升力桨合计（2.16 N·m）的 13 倍。
+#   分配器用最小范数解，会把这个偏航需求全压在推力桨上；而推力桨**不能反向出力**
+#   （油门 < 0 不存在），于是卡在下限 -> unallocated_torque[2] 等于全部需求
+#   -> 偏航权限为 0 -> 起飞就自转（实测 log_3_2026-10-23-16-44-14）。
+#   归零之后分配器只能用升力桨做偏航，权限是对称双向的。
+#   代价：两边推力不一致时那点偏航/滚转飞控不知道，用分别标定 CT 解决。
+#
+# KM = 0：反扭矩由两桨对转抵消，不需要建模。而且 PX4 的反扭矩是绕**桨自己的轴**
+#   （这里主要是机体 x），填非零会额外引入滚转分量。
 # ===========================================================================
+param set-default CA_ROTOR_COUNT 6
+
+param set-default CA_ROTOR4_PX  0
+param set-default CA_ROTOR4_PY  0
+param set-default CA_ROTOR4_PZ -0.05
+param set-default CA_ROTOR4_AX  0.940
+param set-default CA_ROTOR4_AY  0
+param set-default CA_ROTOR4_AZ -0.342
+param set-default CA_ROTOR4_KM  0
+
+param set-default CA_ROTOR5_PX  0
+param set-default CA_ROTOR5_PY  0
+param set-default CA_ROTOR5_PZ -0.05
+param set-default CA_ROTOR5_AX  0.940
+param set-default CA_ROTOR5_AY  0
+param set-default CA_ROTOR5_AZ -0.342
+param set-default CA_ROTOR5_KM  0
+
+# --- 推力桨 CT：满油门单桨推力 [N] ---
+# ⚠ 现在沿用升力桨的 21.6，推力桨/电机不同的话必须实测替换，
+#   否则分配器对"推力气门 -> 力"的换算会整体偏一个比例。
+param set-default CA_ROTOR4_CT 21.6
+param set-default CA_ROTOR5_CT 21.6
+
+# --- 输出映射：电机 5/6 -> PWM_MAIN 第 5/6 路 ---
+# 101..112 = Motor1..12；升力桨已占用 101..104
+#
+# MIN 用 1000，**不是** 1100：
+#   指令为 0 时输出 PWM_MAIN_MINn。升力桨给 1100 是为了留怠速（airmode 靠它
+#   维持姿态权限），但推力桨不需要 —— 1100 时电调会怠速自转，台架/地面上
+#   看得很明显，而且白白耗电、吹风。
+#   给 1000 之后：解锁且指令 0 -> 1000 us -> 电调停转。
+#
+# ⚠ 前提是这两个电调按 1000/2000 标定过行程。如果它们被校准成 1100 低点，
+#   改成 1000 后要重新做一次行程校准，否则可能出现"停不下来"。
+param set-default PWM_MAIN_FUNC5 105
+param set-default PWM_MAIN_FUNC6 106
+param set-default PWM_MAIN_MIN5 1000
+param set-default PWM_MAIN_MIN6 1000
+param set-default PWM_MAIN_MAX5 1900
+param set-default PWM_MAIN_MAX6 1900
 
 # 该机没有空速管
 param set-default SYS_HAS_NUM_ASPD 0
