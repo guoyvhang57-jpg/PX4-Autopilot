@@ -51,7 +51,14 @@ void TransitLeg::start(const matrix::Vector3f &goal, const vehicle_local_positio
 	_goal = goal;
 	_goal_distance = (_goal - matrix::Vector3f(pos.x, pos.y, pos.z)).norm();
 
-	_smoothing.reset(matrix::Vector3f(pos.ax, pos.ay, pos.az),
+	// 不要拿实测加速度（pos.ax/ay/az）当轨迹初始状态。
+	// 真机上这个量逐样本 std 有 1.4~2.2 m/s²，偶尔会抽到 5σ 的样本；平滑器
+	// 会把它原样当成第一拍的加速度发出去 —— 实测抽到过 12.35 m/s²，超过 1 g，
+	// 位置控制器的 body_z = (-a_x, -a_y, g - a_z) 里 g - a_z 变号，姿态解算
+	// 退化，直接给出 30° 滚转（10-22 那趟的真实事故）。
+	// 传 0：平滑器只用位置和速度重新规划，第一拍的加速度一定由它按
+	// MPC_ACC_HOR / MPC_ACC_UP_MAX 自己算，不可能超限。
+	_smoothing.reset(matrix::Vector3f(),
 			 matrix::Vector3f(pos.vx, pos.vy, pos.vz),
 			 matrix::Vector3f(pos.x, pos.y, pos.z));
 }
