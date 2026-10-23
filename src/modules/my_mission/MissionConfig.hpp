@@ -59,6 +59,7 @@ struct MissionConfig {
 	// ---- MYR_*：系绳测试 ----
 	float pitch_down_deg{15.f};  ///< MYR_PITCH_DOWN 拉绳时的低头角 [deg]
 	float tilt_hold{10.f};       ///< MYR_TILT_HOLD 拉绳保持多久 [s]
+	float pull_drift{2.f};       ///< MYR_PULL_DRIFT 拉绳时水平目标允许跟随的半径 [m]
 	float fwd_thr{0.f};         ///< MYR_FWD_THR 前推力电机归一化油门；> 0 时姿态钉在低头上限
 
 };

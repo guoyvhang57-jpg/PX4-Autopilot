@@ -217,6 +217,7 @@ private:
 	matrix::Vector3f _target{};       ///< 位置环目标，机体系无关的本地 NED 坐标
 	matrix::Vector3f _goal3{};        ///< 中转目标（三维 NED）
 	matrix::Vector3f _home{};         ///< 返航目标（home 的水平位置 + 当前高度）
+	matrix::Vector3f _pull_origin{};  ///< 拉绳测试进入 Offboard 时记下的位置，TILT 的目标锚在这里
 	bool _return_started{false};      ///< RETURN 里：航向已对准、轨迹已点亮
 	bool _home_yaw_done{false};       ///< RETURN 里：已到家，正在把航向转回初始方向
 	hrt_abstime _home_rot_start{0};   ///< 到家后开始转航向的时刻，给这一步单独的预算
@@ -274,6 +275,7 @@ private:
 		(ParamFloat<px4::params::MYM_DISARM_TMO>) _param_mym_disarm_tmo,
 		(ParamFloat<px4::params::MYR_PITCH_DOWN>) _param_myr_pitch_down,
 		(ParamFloat<px4::params::MYR_TILT_HOLD>) _param_myr_tilt_hold,
+		(ParamFloat<px4::params::MYR_PULL_DRIFT>) _param_myr_pull_drift,
 		(ParamFloat<px4::params::MYR_FWD_THR>) _param_myr_fwd_thr
 	)
 };

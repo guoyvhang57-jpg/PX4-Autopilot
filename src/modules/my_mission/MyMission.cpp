@@ -182,6 +182,7 @@ void MyMission::refreshConfig()
 
 	_config.pitch_down_deg = _param_myr_pitch_down.get();
 	_config.tilt_hold = _param_myr_tilt_hold.get();
+	_config.pull_drift = _param_myr_pull_drift.get();
 	_config.fwd_thr = _param_myr_fwd_thr.get();
 }
 
@@ -366,10 +367,38 @@ bool MyMission::advanceTransit(const Tick &tick)
 	// PositionControl.cpp:153 把它直接加进加速度指令，绕过了速度环那个
 	// τ ≈ 0.56 s 的一阶滞后。没有它，参考做匀速减速时飞机永远比参考快 a·τ，
 	// 到终点时早就冲过去了（实测 0.39~0.45 m）。
+	// 前馈夹一层硬限。位置控制器的姿态解算是
+	//     body_z = normalize(-a_x, -a_y, g - a_z)
+	// 只要 |a_z| > g，"向上"的向量就翻到下方，姿态解算退化 —— 实测 12.35 m/s²
+	// 的垂直前馈换来 30° 滚转。理论上规划器不会给出这种值（受 MPC_ACC_* 限制），
+	// 但它的初始状态来自实测量，历史上有一次就漏进来了。
+	//   z：留 0.5 g 余量
+	//   水平：按 MPC_TILTMAX_AIR 反算，不能超过"姿态能表达的加速度"
+	matrix::Vector3f a_ff = u.acceleration;
+	const float a_z_max = 0.5f * CONSTANTS_ONE_G;
+	const float a_h_max = CONSTANTS_ONE_G * tanf(math::radians(_external.mpcTiltmaxAir()));
+	matrix::Vector2f a_h(a_ff(0), a_ff(1));
+
+	if (fabsf(a_ff(2)) > a_z_max) {
+		a_ff(2) = math::constrain(a_ff(2), -a_z_max, a_z_max);
+	}
+
+	if (a_h.norm() > a_h_max) {
+		a_h = a_h * (a_h_max / a_h.norm());
+		a_ff(0) = a_h(0);
+		a_ff(1) = a_h(1);
+	}
+
+	if ((a_ff - u.acceleration).norm() > 0.01f) {
+		PX4_WARN("my_mission: feedforward clamped (%.1f %.1f %.1f) -> (%.1f %.1f %.1f)",
+			 (double)u.acceleration(0), (double)u.acceleration(1), (double)u.acceleration(2),
+			 (double)a_ff(0), (double)a_ff(1), (double)a_ff(2));
+	}
+
 	MissionOutput::Setpoint setpoint;
 	setpoint.position = u.position;
 	setpoint.velocity_xy = u.velocity_xy;
-	setpoint.acceleration = u.acceleration;
+	setpoint.acceleration = a_ff;
 	setpoint.yaw = _yaw_sp;
 	publishSetpoint(setpoint, tick.now);
 
@@ -617,6 +646,16 @@ void MyMission::stateWait(const Tick &tick)
 			//   位置 —— 它的定义就是"飞机现在在哪"。）
 			_target = here;
 			_target_valid = true;
+
+			// 记下进入 Offboard 的位置：TILT 段的横向/高度目标锚在这里（见 stateTilt）。
+			_pull_origin = here;
+
+			// 航向锁在**进入的那一刻**，不转回 home.yaw。
+			// 拉绳测试的前提是"机头对着锚点"，而前面的 _yaw_sp = _takeoff_yaw
+			// 会把它转回解锁时的方向 —— 那会让机头离开绳的方向，前馈就变成斜拉。
+			// 锁住之后 TILT 段机体 x 轴在 NED 里是固定的，位置给定才好构造。
+			_yaw_sp = matrix::Eulerf(matrix::Quatf(tick.att.q)).psi();
+
 			_tilt_ff = 0.f;
 			_last_rope_log = 0;
 			enterState(State::Tilt, tick.now);
@@ -819,20 +858,56 @@ void MyMission::stateTilt(const Tick &tick)
 		_tilt_ff = math::max(_tilt_ff - a_step, a_target);
 	}
 
-	// ---- 水平目标跟着飞机走 ----
-	// 不跟的话位置环会把"低头把飞机推出去"的那段位移当成跟踪误差，反过来把前馈
-	// 抵消掉：实测 a_ff = 1.73 m/s² 时，控制器输出的 acc_sp 只剩 0.05~0.14，
-	// 姿态停在 0.2 度（本来要 10 度），飞机只有 0.8 m 的漂移就稳住了。
-	// 跟着走之后位置误差≈0，需求就只剩下面前馈；速度环仍然把水平速度压到 0，
-	// 所以飞机不会一直往前爬。
+	// ===========================================================
+	// 目标：机体坐标系下"只推前后，左右和上下不动"
+	// ===========================================================
+	// 航向在进 Offboard 时锁住了（见 stateWait），所以机体 x/y 轴在 NED 里是
+	// 固定的两个单位向量，可以把给定直接分解过去：
+	//     dir  = 机体 x（机头）-> 拉力方向
+	//     perp = 机体 y（右侧）
 	//
-	// z **不跟**：高度靠位置环维持，跟着走等于放弃高度控制。
-	_target(0) = tick.pos.x;
-	_target(1) = tick.pos.y;
+	// 沿线（前后）：位置和速度给定都用**实测值** -> 误差恒为 0 -> 位置环和速度环
+	// 都不出力（积分也不会累积），加速度指令里只剩前馈 a_ff。
+	// 这样前馈不会被"错位的目标点"抵消掉，姿态稳定在 MYR_PITCH_DOWN，
+	// 拉力 = m*g*tan(倾角)，可以算得准。
+	// 之前用"进入点 ± 半径"夹紧时，飞机被推到绷紧点后位置误差变成负值，
+	// 速度积分反向累积，40 秒就把 9.31 m/s² 的前馈吃成 0.15。
+	//
+	// 横向（左右）和高度：给定钉在进入点，位置环正常工作，锁住线和高度。
+	// 代价：沿线方向完全没有反馈，绳没挂上就会一路加速 —— 所以下面有个里程兜底。
+	const float psi = _yaw_sp;
+	const matrix::Vector2f dir(cosf(psi), sinf(psi));
 
-	// 沿起飞航向的加速度前馈；z 给 NaN = 不做前馈，让位置环自己维持高度。
+	const matrix::Vector2f from_origin(tick.pos.x - _pull_origin(0),
+					   tick.pos.y - _pull_origin(1));
+	const float along = from_origin.dot(dir);        // 沿线位移，正 = 往前
+
+	// 里程兜底：绳在的时候绷紧距离实测 0.66 m，给到几米还超出去说明没挂上。
+	// 不兜的话沿线是开环的，会以 a_ff 一直加速（2.63 m/s² 十秒就是 26 m/s）。
+	const float drift_max = math::max(_config.pull_drift, 0.5f);
+
+	if (along > drift_max) {
+		PX4_WARN("my_mission: pulled %.1f m without resistance (rope attached?), landing",
+			 (double)along);
+		enterState(State::Land, tick.now);
+		_land_cmd_sent = false;
+		return;
+	}
+
+	// 位置给定 = 进入点 + dir*along：沿线分量等于当前位置（误差 0），
+	// 横向分量仍是进入点（误差 = 偏出去的横向距离，由位置环拉回来）。
+	_target(0) = _pull_origin(0) + dir(0) * along;
+	_target(1) = _pull_origin(1) + dir(1) * along;
+	// z 用记下来的高度，不跟随。
+
 	MissionOutput::Setpoint setpoint = targetSetpoint();
-	setpoint.acceleration = matrix::Vector3f(_tilt_ff * cosf(_takeoff_yaw), _tilt_ff * sinf(_takeoff_yaw), NAN);
+
+	// 速度前馈：沿线用实测速度（速度误差归零），横向给 0（让速度环阻尼横向晃动）。
+	setpoint.velocity_xy = dir * matrix::Vector2f(tick.pos.vx, tick.pos.vy).dot(dir);
+
+	// 加速度前馈：只有沿线分量 —— 这就是"期望的前进力"（F = m*a_ff）。
+	// z 给 NaN = 不做前馈，高度交给位置环。
+	setpoint.acceleration = matrix::Vector3f(_tilt_ff * dir(0), _tilt_ff * dir(1), NAN);
 	publishSetpoint(setpoint, tick.now);
 
 	// 1 Hz 打一次实测的斜距 / 绳角 / 俯仰，和 gz 那边的张力遥测对表：
@@ -845,9 +920,15 @@ void MyMission::stateTilt(const Tick &tick)
 		// 实际俯仰角。Eulerf 的 theta 正 = 抬头，所以"低头角"要取负。
 		const float pitch_real = -math::degrees(matrix::Eulerf(matrix::Quatf(tick.att.q)).theta());
 
-		PX4_INFO("my_mission: TILT demand %.1f deg (a_ff %.2f, thr %.0f%%), actual %.1f deg, alt %.2f m",
+		const matrix::Vector2f off_origin(tick.pos.x - _pull_origin(0), tick.pos.y - _pull_origin(1));
+		const matrix::Vector2f pull_dir(cosf(psi), sinf(psi));
+
+		// along  = 沿线（前后）走了多远，就是绳被拉出去的量
+		// lateral= 横向偏了多少，位置环应该把它压回 0
+		PX4_INFO("my_mission: TILT demand %.1f deg (a_ff %.2f, thr %.0f%%), actual %.1f deg, alt %.2f m, along %.2f m, lat %.2f m",
 			 (double)pitch_used, (double)_tilt_ff, (double)(thr * 100.f), (double)pitch_real,
-			 (double)(-here(2)));
+			 (double)(-here(2)), (double)off_origin.dot(pull_dir),
+			 (double)off_origin.dot(matrix::Vector2f(-pull_dir(1), pull_dir(0))));
 	}
 
 	// 保持时间用 MYR_TILT_HOLD，**不是 MYM_HOVER** —— 低头保持多久和
