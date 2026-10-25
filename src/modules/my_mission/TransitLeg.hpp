@@ -82,6 +82,14 @@ public:
 	TransitLeg() = default;
 	~TransitLeg() = default;
 
+	/**
+	 * @brief 把一组限幅塞进平滑器
+	 *
+	 * 每次进中转状态都调一遍（不是只在启动时调）：代价只是几个赋值，换来的是
+	 * 运行中改 MYM_* / MPC_* 立刻生效，不用重启模块。
+	 *
+	 * @param limits 本次航段的速度/加速度/jerk/允许误差限幅
+	 */
 	void setLimits(const Limits &limits);
 
 	/**
@@ -94,26 +102,54 @@ public:
 	void setJerk(float jerk) { _smoothing.setMaxJerk(math::max(jerk, 0.1f)); }
 
 	/**
-	 * @brief 从飞机的当前三阶状态点亮平滑器，开始一段新航程
+	 * @brief 用飞机的当前位置和速度点亮平滑器，开始一段新航程
 	 *
-	 * 给加速度是关键 —— 轨迹的加速度从飞机此刻的加速度出发，
-	 * 任何一个阶次上都不出现跳变。GotoControl.cpp:71-75 是同样的做法。
+	 * 位置和速度都取实测值，轨迹因此从飞机此刻的状态出发，前两个阶次不跳变。
+	 *
+	 * 加速度**故意不取实测值**（pos.ax/ay/az）：真机上它逐样本 std 有 1.4~2.2 m/s²，
+	 * 而平滑器会把初始状态当作第一拍的加速度前馈原样发出去，抽到一个 5σ 样本就会
+	 * 被直接加进位置控制器的加速度指令（实测抽到过 12.35 m/s² 向下，超过 1 g，
+	 * 把 body_z 的映射翻了过来，姿态变成 30° 滚转）。交给规划器自己算，第一拍的
+	 * 加速度一定落在 MPC_ACC_HOR / MPC_ACC_UP_MAX 以内。
+	 *
+	 * @param goal 终点（NED，单位 m）
+	 * @param pos  飞机当前状态，只取位置和速度
 	 */
 	void start(const matrix::Vector3f &goal, const vehicle_local_position_s &pos);
 
-	/// 每拍推进一次。调用前必须先 start()。
+	/**
+	 * @brief 推进一拍，给出这一拍的参考
+	 *
+	 * 调用前必须先 start()。
+	 *
+	 * @param pos 飞机当前位置（平滑器用它算跟踪误差，误差越大参考走得越慢）
+	 * @param dt  距上一拍的实际周期 [s]，平滑器靠它推进内部轨迹时间
+	 * @return 位置参考、水平速度前馈、加速度前馈、以及离终点还剩多远
+	 */
 	Update update(const vehicle_local_position_s &pos, float dt);
 
-	/// 到位判据只比**轨迹**；"飞机速度也小"是调用方的策略，不在这里
+	/**
+	 * @brief 轨迹是否已经贴住终点
+	 *
+	 * 只比**轨迹**离终点多远。"飞机速度也要小"是调用方的策略，不放在这里 ——
+	 * 轨迹到了不等于飞机到了，两者必须分开判。
+	 *
+	 * @param arrive_radius 到位半径 [m]，通常给 MYM_ARRIVE
+	 * @return true = 轨迹距终点小于 arrive_radius
+	 */
 	bool arrived(float arrive_radius) const { return _goal_distance < arrive_radius; }
 
 	/**
-	 * @brief 粗略估计"走 distance 米、巡航 speed、加减速 accel"要多久
+	 * @brief 粗略估计一段航程要飞多久
 	 *
-	 * 就是理想梯形曲线的时间：加速段 + 匀速段 + 减速段。
-	 * 真实的轨迹因为 jerk 受限会更慢一点，所以这是个**乐观下界**，
-	 * 拿来和 MYM_FWD_TMO 对一下、提醒参数设小了够用。
-	 * 短距离时全程都在加减速，永远到不了 speed，走的是三角形的那个分支。
+	 * 就是理想梯形曲线的时间：加速段 + 匀速段 + 减速段。真实轨迹因为 jerk 受限会
+	 * 略慢一点，所以这是个**乐观下界**，用来和 MYM_FWD_TMO 对一下，提醒参数设小了。
+	 * 距离短到全程都在加减速、永远到不了 speed 时，走的是三角形的那个分支。
+	 *
+	 * @param distance 航程长度 [m]
+	 * @param speed    巡航速度 [m/s]
+	 * @param accel    加减速上限 [m/s^2]
+	 * @return 估计耗时 [s]
 	 */
 	static float estimateDuration(float distance, float speed, float accel);
 

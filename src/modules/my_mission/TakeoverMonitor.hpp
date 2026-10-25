@@ -59,12 +59,23 @@ public:
 	 *   Sticks::getThrottleZeroCenteredExpo() = expo(deadzone(throttle, MAN_DEADZONE), 0.6)
 	 *   math::deadzone() 在 |x| <= deadzone 时返回 0，而 expo(0) = 0
 	 *   => "在中位" 等价于 |throttle| <= MAN_DEADZONE（默认 0.1，归一化行程）
+	 *
+	 * @param manual_control 当前遥控器输入
+	 * @param deadzone       油门死区（归一化行程），取自 MAN_DEADZONE
+	 * @return true = 油门在中位，切 Position/Altitude 会保持高度
 	 */
 	static bool throttleCentered(const manual_control_setpoint_s &manual_control, float deadzone);
 
 	/**
 	 * @brief 当前这个模式离开 Offboard 会不会掉高度/掉高？
 	 *
+	 * 只有在"当前不在 Offboard、还没上锁、油门不在中位"时才算危险。判定通过时
+	 * 会打一条 Critical 告警，但**拦不住**飞机 —— 模式是 commander 切的，
+	 * 本模块不抢控制权，只负责让人知道接下来会发生什么。
+	 *
+	 * @param status         当前载具状态（取 nav_state 和 arming_state）
+	 * @param manual_control 当前遥控器输入（取油门）
+	 * @param deadzone       油门死区（归一化行程）
 	 * @return true = 危险，并且已经打了一条告警（调用方自己决定要不要闩锁去重）
 	 */
 	bool evaluate(const vehicle_status_s &status, const manual_control_setpoint_s &manual_control,

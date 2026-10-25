@@ -84,15 +84,55 @@ public:
 	MyMission();
 	~MyMission() override;
 
+	/**
+	 * @brief 模块启动入口（`my_mission start`）
+	 *
+	 * 挂到工作队列上跑，所以只有一个任务，不存在多实例。
+	 *
+	 * @param argc 参数个数
+	 * @param argv 参数表
+	 * @return PX4_OK = 启动成功
+	 */
 	static int task_spawn(int argc, char *argv[]);
+
+	/**
+	 * @brief 未识别的子命令
+	 * @param argc 参数个数
+	 * @param argv 参数表
+	 * @return 永远返回错误，并打印用法
+	 */
 	static int custom_command(int argc, char *argv[]);
+
+	/**
+	 * @brief 打印模块用法的标题部分
+	 * @param reason 打印前的提示语，可为 nullptr
+	 * @return 永远返回错误码（用于 `my_mission help`）
+	 */
 	static int print_usage(const char *reason = nullptr);
 
+	/**
+	 * @brief `my_mission status`：打印状态机当前状态和几个关键量
+	 *
+	 * 包含状态、目标点、航向锁存值、拉绳段参数、以及"现在把模式拨出 Offboard
+	 * 会不会掉高度"的提示。
+	 *
+	 * @return PX4_OK
+	 */
 	int print_status() override;
 
+	/**
+	 * @brief 初始化：拿参数、订阅 topic、把 Run() 挂到工作队列
+	 * @return true = 成功
+	 */
 	bool init();
 
 private:
+	/**
+	 * @brief 主循环，50 Hz
+	 *
+	 * 每拍取数 -> 刷参数 -> 发 offboard_control_mode / 辅助许可 -> 安全兜底检查
+	 * -> 按状态分发表调用对应的 stateXxx()。
+	 */
 	void Run() override;
 
 	// 状态机：整个任务就是这 9 个状态之间的迁移。
@@ -130,6 +170,11 @@ private:
 
 	using Handler = void (MyMission::*)(const Tick &);
 
+	/**
+	 * @brief 状态名，用于日志和 `my_mission status`
+	 * @param state 状态枚举
+	 * @return 静态字符串，如 "FORWARD"
+	 */
 	static const char *stateName(State state);
 
 	// ---- 9 个状态函数：每个都自己负责 _state / _state_start 的迁移 ----
@@ -137,31 +182,150 @@ private:
 	// （_land_cmd_sent = false、_takeoff_yaw 锁存、几何解算……），而且 Disarm→Done
 	// 是**故意不刷** _state_start 的。让每个函数照自己原来的写法改状态，
 	// 这次重构才是"纯搬迁"，行为一个字节都不变。
+	/**
+	 * @brief 等待 armed + Offboard + 位置有效，并把 setpoint 钉在当前位置
+	 *
+	 * 三个条件齐了之后按"是不是已经离地"分叉：
+	 * 在地上 -> TAKEOFF；已在空中且离 home 超过 MYM_ARRIVE -> TILT（拉绳测试）。
+	 * 同时在这里锁存 home / 地面高度 / 起飞航向这三个基准。
+	 *
+	 * @param tick 这一拍的输入
+	 */
 	void stateWait(const Tick &tick);
+
+	/**
+	 * @brief 垂直爬升到 home 上方 MYM_ALT
+	 *
+	 * 到位判据是"位置误差 < MYM_ARRIVE 且速度 < 0.3"。到位后按 MYM_FWD_DIST
+	 * 决定进 FORWARD 还是直接 HOVER。
+	 *
+	 * @param tick 这一拍的输入
+	 */
 	void stateTakeoff(const Tick &tick);
+
+	/**
+	 * @brief 用 TransitLeg 飞向"起飞点 + MYM_FWD_DIST"
+	 *
+	 * 每拍的轨迹推进、发布、到位判据都在 advanceTransit() 里；本函数只处理
+	 * 到位之后的迁移（钉住终点 -> HOVER）和超时（MYM_FWD_TMO -> LAND）。
+	 *
+	 * @param tick 这一拍的输入
+	 */
 	void stateForward(const Tick &tick);
+
+	/**
+	 * @brief 拉绳测试：机体坐标系下只推前后，左右和上下不动
+	 *
+	 * 沿机体 x 轴：位置和速度给定都用实测值，误差恒为 0，加速度指令里只剩
+	 * 前馈 a_ff = g*tan(MYR_PITCH_DOWN)（MYR_FWD_THR > 0 时再加上推力桨的份额）。
+	 * 横向和高度钉在进入 Offboard 的那个点，由位置环负责。保持 MYR_TILT_HOLD 秒，
+	 * 时间到之后先把前馈斜坡退回 0 再转 LAND。
+	 *
+	 * @param tick 这一拍的输入
+	 */
 	void stateTilt(const Tick &tick);
+
+	/**
+	 * @brief 保持当前 setpoint 悬停 MYM_HOVER 秒
+	 *
+	 * 之后有有效 home 就进 RETURN，没有就地降落（别乱飞）。
+	 *
+	 * @param tick 这一拍的输入
+	 */
 	void stateHover(const Tick &tick);
+
+	/**
+	 * @brief 返航，分三个阶段
+	 *
+	 * ① 原地把机头对准 home（30 deg/s 斜坡 + 角速度前馈）；
+	 * ② 用 TransitLeg 飞回 home；
+	 * ③ 到了之后原地把航向转回起飞时的方向，然后降落。
+	 *
+	 * 每个阶段都有单独的超时兜底，转不过去 / 飞不回去就地降落。
+	 *
+	 * @param tick 这一拍的输入
+	 */
 	void stateReturn(const Tick &tick);
-	void _startReturnTransit(const Tick &tick);   ///< RETURN 里"对准航向之后"点亮轨迹
+
+	/**
+	 * @brief RETURN 第一阶段结束：点亮回程轨迹
+	 *
+	 * 故意不复用 enterTransit()：那个会 enterState()，会把 _return_started 清掉，
+	 * 于是又退回"对准航向"那一步。
+	 *
+	 * @param tick 这一拍的输入
+	 */
+	void _startReturnTransit(const Tick &tick);
 
 	/**
 	 * @brief 本拍该用多大 jerk —— 按需求姿态离低头限幅的比例在 max/min 之间插值
 	 *
 	 * 需求角取自**上一拍发出去的水平加速度前馈**（_transit_acc_xy），
 	 * 只用 20 ms 之前的信息，不构成一个和位置环对抗的环。
+	 *
+	 * @return 本拍该用的 jerk 上限 [m/s^3]
 	 */
 	float scheduledJerk() const;
 
-	/// 航向是否已经稳定在 target_yaw 上：误差够小 **而且** 不再转
+	/**
+	 * @brief 航向是否已经稳定在目标上
+	 *
+	 * 两个条件都要满足：角度误差够小 **而且** 角速度也已经降下来 —— 只看误差的话
+	 * 高速掠过目标那一刻也会被判成"到了"。
+	 *
+	 * @param tick       这一拍的输入（取实测姿态和角速度）
+	 * @param target_yaw 目标航向 [rad]
+	 * @return true = 误差 < kReturnYawErrMax 且角速度 < kReturnYawRateMax
+	 */
 	bool yawSettled(const Tick &tick, float target_yaw);
 
-	/// 让偏航给定以固定速率斜坡到 target_yaw，并把 setpoint 发出去（用当前 _target）
+	/**
+	 * @brief 让偏航给定以固定速率斜坡到目标，并把 setpoint 发出去
+	 *
+	 * 给定值自己按 kReturnYawSlew 走，同时把"正在以多快转"用 yawspeed 前馈给
+	 * 姿态环的参考模型 —— 只给角度斜坡的话，误差永远只有一步，转不起来。
+	 * 位置部分用当前的 _target，本函数只改航向。
+	 *
+	 * @param tick       这一拍的输入
+	 * @param target_yaw 目标航向 [rad]
+	 */
 	void _rampYaw(const Tick &tick, float target_yaw);
+
+	/**
+	 * @brief 降落
+	 *
+	 * 方式 1（MYM_LAND_MODE=1）：发一次 NAV_LAND 交给 PX4 的 AUTO_LAND；
+	 * 方式 0：自己在 Offboard 里按 MYM_DESC_RATE 把 z 目标一帧帧压到地面。
+	 *
+	 * @param tick 这一拍的输入
+	 */
 	void stateLand(const Tick &tick);
+
+	/**
+	 * @brief 发上锁命令，1 Hz 重试直到真的退锁
+	 *
+	 * @param tick 这一拍的输入
+	 */
 	void stateDisarm(const Tick &tick);
+
+	/**
+	 * @brief 任务结束：把目标钉在当前位置等上锁
+	 *
+	 * 已上锁就回 WAIT，下一次 arm + Offboard 会自动重跑整个流程。
+	 *
+	 * @param tick 这一拍的输入
+	 */
 	void stateDone(const Tick &tick);
 
+	/**
+	 * @brief 切到下一个状态并刷新计时基准
+	 *
+	 * 顺带清掉那些"每段独立"的闩锁（减速闩锁、返航阶段标记、航向斜坡标记），
+	 * 否则上一段的残留状态会带到下一段。
+	 *
+	 * @param next 下一个状态
+	 * @param now  迁移发生的时刻
+	 */
 	void enterState(State next, hrt_abstime now)
 	{
 		_state = next;
@@ -172,28 +336,112 @@ private:
 	}
 
 	// ---- 中转（FORWARD / ROPE 共用）----
+	/**
+	 * @brief 从当前参数和 PX4 参数组装出 TransitLeg 的限幅
+	 * @return 本次航段使用的限幅
+	 */
 	TransitLeg::Limits transitLimits() const;
+
+	/**
+	 * @brief 点亮中转轨迹（以 _goal3 为终点），并切到 next 状态
+	 *
+	 * @param tick 这一拍的输入
+	 * @param next 中转结束后要进入的状态（Forward 或 Return）
+	 */
 	void enterTransit(const Tick &tick, State next);
-	bool advanceTransit(const Tick &tick);   ///< 推进一拍并发布，返回"到位"
+
+	/**
+	 * @brief 推进一拍中转、发布 setpoint，并判断是否到位
+	 *
+	 * 内部还负责：按需求姿态调度 jerk、判该不该关前推力辅助、给加速度前馈夹硬限。
+	 *
+	 * @param tick 这一拍的输入
+	 * @return true = 轨迹贴住终点 **且** 飞机速度也够小
+	 */
+	bool advanceTransit(const Tick &tick);
 
 	// ---- 系绳测试 ----
+	/**
+	 * @brief 打一行"这次中转要飞多远、用什么速度、估计多久"
+	 *
+	 * @param tick 这一拍的输入（起点取当前位置）
+	 */
 	void logTransitStart(const Tick &tick);
 
 	// ---- 每拍 / 事件驱动的杂项 ----
+	/// 把 MYM_* / MYR_* 的最新值刷进 _config 快照（启动时和每次 parameter_update）
 	void refreshConfig();
+
+	/**
+	 * @brief 转发到 MissionOutput，声明位置型 Offboard
+	 * @param now 本拍时间戳
+	 */
 	void publishControlMode(hrt_abstime now) { _output.publishControlMode(now); }
+
+	/**
+	 * @brief 转发到 MissionOutput，发布一帧 trajectory_setpoint
+	 * @param setpoint 这一拍要发的内容
+	 * @param now      本拍时间戳
+	 */
 	void publishSetpoint(const MissionOutput::Setpoint &setpoint, hrt_abstime now)
 	{
 		_output.publishSetpoint(setpoint, now);
 	}
 
-	/// "什么都不额外给，只把位置钉在 _target 上"—— 大多数状态用的就是这一帧
+	/**
+	 * @brief 什么都不额外给，只把位置钉在 _target 上
+	 *
+	 * 大多数状态用的就是这一帧：位置 = _target，速度/加速度为 NaN（不控制），
+	 * 航向 = _yaw_sp。_target_valid 为 false 时位置发 NaN。
+	 *
+	 * @return 一帧只含位置和航向的 setpoint
+	 */
 	MissionOutput::Setpoint targetSetpoint() const;
 
 	// ---- 状态判断 / 工具 ----
+	/**
+	 * @brief 位置估计现在能不能用
+	 *
+	 * xy_valid / z_valid 是 EKF 给的"这两个通道能不能信"；再加一个 500 ms 的
+	 * 新鲜度判断 —— EKF 挂了之后 topic 还在，只看 valid 位会拿旧数据继续飞。
+	 *
+	 * @param pos 位置估计
+	 * @param now 本拍时间戳
+	 * @return true = 两个通道都有效且数据不超过 500 ms
+	 */
 	static bool localPositionValid(const vehicle_local_position_s &pos, hrt_abstime now);
+
+	/**
+	 * @brief 是否已经到达 _target
+	 *
+	 * 位置误差小于 MYM_ARRIVE **且** 速度小于 0.3 m/s —— 只判位置的话，飞过目标点
+	 * 那一瞬间误差也是 0，会被误判成到了。
+	 *
+	 * @param pos 当前位置（含速度）
+	 * @return true = 位置和速度都收住了
+	 */
 	bool reachedTarget(const vehicle_local_position_s &pos) const;
-	void holdCurrentPosition(const vehicle_local_position_s &pos, const vehicle_attitude_s &att, bool pos_valid);
+
+	/**
+	 * @brief 把 _target 钉在当前位置、_yaw_sp 钉在当前航向
+	 *
+	 * WAIT / DONE 阶段这样发，飞机不会动；万一这时飞手切进 Offboard，位置环的
+	 * 目标就是当前位置，不会突然冲出去。
+	 *
+	 * @param pos       当前位置
+	 * @param att       当前姿态（取航向）
+	 * @param pos_valid 位置是否有效；无效时不更新 _target
+	 */
+	void holdCurrentPosition(const vehicle_local_position_s &pos, const vehicle_attitude_s &att,
+				 bool pos_valid);
+
+	/**
+	 * @brief 距某个时刻过去了多久
+	 *
+	 * @param start 起始时刻
+	 * @param now   当前时刻
+	 * @return 秒
+	 */
 	static float elapsedSince(hrt_abstime start, hrt_abstime now) { return (now - start) * 1e-6f; }
 
 	// ---- 组件 ----

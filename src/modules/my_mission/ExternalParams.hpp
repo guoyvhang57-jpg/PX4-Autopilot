@@ -45,29 +45,66 @@ public:
 	ExternalParams() = default;
 	~ExternalParams() = default;
 
-	/// 启动时调一次，之后每次收到 parameter_update 再调
+	/**
+	 * @brief 把外部参数的最新值抄进本地镜像
+	 *
+	 * 启动时调一次，之后每次收到 parameter_update 再调一次 —— 所以改 MPC_* /
+	 * MAN_DEADZONE 不用重启本模块。
+	 */
 	void refresh();
 
-	/// 判"油门算不算在中位"的死区，归一化行程
+	/**
+	 * @brief 判"油门算不算在中位"的死区
+	 * @return MAN_DEADZONE（归一化行程，默认 0.1）
+	 */
 	float manDeadzone() const { return value(ManDeadzone); }
 
-	/// land detector 认"被指令下降"的最低速度 = 1.1 * LNDMC_Z_VEL_MAX
+	/**
+	 * @brief land detector 认"被指令下降"的最低下降速度
+	 *
+	 * Offboard 自己下降时必须把 z 速度前馈给到这个值以上，否则 detector 的
+	 * `_in_descend` 恒为 false，landed 永远判不出来，后面的上锁全被拒。
+	 *
+	 * @return 1.1 * LNDMC_Z_VEL_MAX [m/s]
+	 */
 	float inDescendMinVel() const { return 1.1f * value(LndmcZVelMax); }
 
-	// PositionSmoothing 的限制（口径同 GotoControl.hpp:99-102）
+	// ---- PositionSmoothing 的限幅（口径同 GotoControl.hpp:99-102）----
+
+	/// @return MPC_XY_ERR_MAX，水平允许误差 [m]
 	float mpcXyErrMax() const { return value(MpcXyErrMax); }
+
+	/// @return MPC_Z_ERR_MAX，垂直允许误差 [m]
 	float mpcZErrMax() const { return value(MpcZErrMax); }
+
+	/// @return MPC_XY_VEL_MAX，水平速度硬上限 [m/s]
 	float mpcXyVelMax() const { return value(MpcXyVelMax); }
+
+	/// @return MPC_Z_V_AUTO_UP，自动模式上升速度 [m/s]
 	float mpcZvAutoUp() const { return value(MpcZvAutoUp); }
+
+	/// @return MPC_ACC_UP_MAX，垂直加速上限 [m/s^2]
 	float mpcAccUpMax() const { return value(MpcAccUpMax); }
 
-	/// TILT 段把 MYR_PITCH_DOWN 夹在它以内 [deg]
+	/**
+	 * @brief 姿态角硬上限
+	 * @return MPC_TILTMAX_AIR [deg]，TILT 段用它夹 MYR_PITCH_DOWN
+	 */
 	float mpcTiltmaxAir() const { return value(MpcTiltmaxAir); }
 
-	/// 前推力辅助的低头角上限 [deg]，负值 = 低头；0 = 没设。TILT 用它当作"姿态能到多低"的上界
+	/**
+	 * @brief 前推力辅助的低头角上限
+	 * @return MYM_PITCH_MIN [deg]，负值 = 低头，0 = 没设。TILT 用它当"姿态能到多低"的上界
+	 */
 	float mymPitchMin() const { return value(MymPitchMin); }
 
-	/// 前推力辅助的"缺额 [N] -> 归一化推力"换算系数，TILT 用它把油门反解成加速度
+	/**
+	 * @brief 前推力辅助的"力缺额 -> 归一化推力"换算系数
+	 *
+	 * TILT 段靠它把 MYR_FWD_THR 反解成加速度，和辅助正向用的必须是同一个值。
+	 *
+	 * @return MYM_FWD_THR_SC（默认 0.44）
+	 */
 	float mymFwdThrSc() const { return value(MymFwdThrSc); }
 
 private:
@@ -91,6 +128,11 @@ private:
 		float value;
 	};
 
+	/**
+	 * @brief 取某个镜像参数的最新值
+	 * @param index Index 枚举里的下标
+	 * @return 参数值；还没 refresh 过时是表里写的默认值
+	 */
 	float value(int index) const { return _mirrors[index].value; }
 
 	Mirror _mirrors[Count] = {
