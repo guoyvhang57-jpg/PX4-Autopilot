@@ -111,10 +111,11 @@ public:
 	 * 控制器每拍读一次，超过 100 ms 没收到就按"允许"处理 —— 所以模块挂掉时
 	 * 辅助会保持原状，不会因为断流而突然失效。
 	 *
-	 * @param enabled 本阶段是否允许辅助出力
-	 * @param now     本拍时间戳
+	 * @param enabled       本阶段是否允许辅助出力
+	 * @param fwd_thrust_sc 缺额 -> 归一化前推力的换算系数（0 = 用控制器参数里的值）
+	 * @param now           本拍时间戳
 	 */
-	void publishAssist(bool enabled, hrt_abstime now);
+	void publishAssist(bool enabled, float fwd_thrust_sc, hrt_abstime now);
 
 private:
 	bool _offboard{false};

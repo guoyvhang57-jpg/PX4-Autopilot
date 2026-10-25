@@ -524,6 +524,7 @@ private:
 		(ParamFloat<px4::params::MYR_PITCH_DOWN>) _param_myr_pitch_down,
 		(ParamFloat<px4::params::MYR_TILT_HOLD>) _param_myr_tilt_hold,
 		(ParamFloat<px4::params::MYR_PULL_DRIFT>) _param_myr_pull_drift,
-		(ParamFloat<px4::params::MYR_FWD_THR>) _param_myr_fwd_thr
+		(ParamFloat<px4::params::MYR_FWD_THR>) _param_myr_fwd_thr,
+		(ParamFloat<px4::params::MYM_FWD_THR_SC>) _param_myr_fwd_thr_sc
 	)
 };

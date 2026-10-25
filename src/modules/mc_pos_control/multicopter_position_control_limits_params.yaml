@@ -145,16 +145,24 @@ parameters:
         short: 缺失水平力到前推力的换算系数
         long: |-
           把缺失的水平力 [N] 换算成写进 thrust_body[0] 的归一化前推力。
-          这是**几何换算，不是调参增益**。
+          这是**几何换算，不是调参增益**：
 
-          SC = m * g / K_F
+              SC = m*g / K_F
 
-          K_F 是一个单位的 thrust_body[0] 能产生的前向力 [N]，由分配器几何决定：
-          gz 的 towed 机架（CA_ROTOR_COUNT 6，四个升力桨 + 两个装在 70° 的推进电机）
-          一个单位 thrust_body[0] 约等于 90.7 N 前向力，按 4.087 kg 算是
-          40.09 / 90.7 = 0.44。
+          K_F 是一个单位的 thrust_body[0] 能产生的前向力 [N]，由分配器几何决定。
+
+          **填 0 = 自动算（推荐）**：my_mission 会从机体的物理量推出来，通过
+          my_mission_assist.fwd_thrust_sc 每拍发过来：
+
+              SC = MPC_THR_HOVER * (4 + 2*|CA_ROTOR4_AZ|) / CA_ROTOR4_AX
+
+          这样改 CA_ROTOR*_CT 或 MPC_THR_HOVER 时它会自动跟上，不会出现
+          "三个地方各填一个数、互相矛盾"的情况（曾经出现过 CT=21.6、
+          MPC_THR_HOVER=0.41、SC=0.44 三者互不一致）。
+
+          填正数则直接用（不跑 my_mission 时也用这个值）。
       type: float
-      default: 0.44
+      default: 0.0
       min: 0.0
       max: 5.0
       decimal: 3

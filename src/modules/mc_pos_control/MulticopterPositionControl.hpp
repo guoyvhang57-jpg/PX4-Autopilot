@@ -115,6 +115,7 @@ private:
 
 	hrt_abstime _assist_timestamp{0};		/**< 上一帧阶段许可的时间戳，用来判超时 */
 	bool _assist_enabled_by_mission{false};		/**< 没收到或超时时按"禁止"处理（fail-closed） */
+	float _assist_fwd_thrust_sc{0.f};		/**< 任务算出来的缺额换算系数；0 = 用参数 MYM_FWD_THR_SC */
 
 	hrt_abstime _time_stamp_last_loop{0};		/**< time stamp of last loop iteration */
 	hrt_abstime _time_position_control_enabled{0};

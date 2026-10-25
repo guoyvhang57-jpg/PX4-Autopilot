@@ -421,6 +421,7 @@ void MulticopterPositionControl::Run()
 			if (_my_mission_assist_sub.copy(&assist)) {
 				_assist_timestamp = assist.timestamp;
 				_assist_enabled_by_mission = assist.enabled;
+				_assist_fwd_thrust_sc = assist.fwd_thrust_sc;
 			}
 
 			if (hrt_absolute_time() - _assist_timestamp > 500_ms) {
@@ -546,11 +547,16 @@ void MulticopterPositionControl::Run()
 			//
 			// 门控放在这里而不是 PositionControl，因为那个类只是纯控制律，拿不到飞行模式。
 			// 它同时会忽略非负的 MYM_PITCH_MIN，所以参数配错也不会把姿态强行变成抬头。
+			// 换算系数优先用任务算出来的那个（它从 MPC_THR_HOVER 和机体几何推出来，
+			// 改 CT / 悬停油门时会自动跟上）；任务没给（旧配置填 0）才退回参数。
+			const float fwd_thrust_sc = (_assist_fwd_thrust_sc > FLT_EPSILON)
+						    ? _assist_fwd_thrust_sc : _param_mym_fwd_thr_sc.get();
+
 			_control.setForwardThrust(_param_mym_fwd_thr_en.get() != 0
 						  && _vehicle_control_mode.flag_control_offboard_enabled
 						  && _assist_enabled_by_mission,
 						  math::radians(_param_mym_pitch_min.get()),
-						  _param_mym_fwd_thr_sc.get(),
+						  fwd_thrust_sc,
 						  _param_mym_fwd_thr_max.get());
 
 			const float speed_up = _takeoff.updateRamp(dt,

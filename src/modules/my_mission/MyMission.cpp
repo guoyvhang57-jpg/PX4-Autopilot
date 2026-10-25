@@ -184,6 +184,37 @@ void MyMission::refreshConfig()
 	_config.tilt_hold = _param_myr_tilt_hold.get();
 	_config.pull_drift = _param_myr_pull_drift.get();
 	_config.fwd_thr = _param_myr_fwd_thr.get();
+
+	// ---- 缺额换算系数：填 0 就自动算 ----
+	//
+	// SC = m*g / K_F，其中
+	//   K_F   = 分配器对推力轴 x 的归一化基准 = CA_ROTOR4_CT * CA_ROTOR4_AX
+	//           （推力桨的 CT 和 AX 相乘，CT 在分子分母里抵消掉，所以这里不出现）
+	//   m*g   = MPC_THR_HOVER × 全部旋翼的竖直满推能力
+	//         = MPC_THR_HOVER × (4*CT_lift + 2*CT_thruster*|AZ|)
+	//
+	// 两个 CT 都当场消掉，最后只剩机体几何和悬停占比：
+	//
+	//   SC = MPC_THR_HOVER * (N_lift + N_thr*|AZ_thr|) / AX_thr
+	//      = MPC_THR_HOVER * (4 + 2*0.342) / 0.94
+	//      = MPC_THR_HOVER * 4.98
+	//
+	// 这样改 CT / MPC_THR_HOVER 时 SC 自动跟着变，不会再出现"三处各填一个数、
+	// 互相矛盾"的情况（上一版就是 CT=21.6、MPC_THR_HOVER=0.41、SC=0.44，三个都不一致）。
+	// 填一个正数则直接用（兼容旧配置，也方便临时试验）。
+	const float sc_param = _param_myr_fwd_thr_sc.get();
+
+	if (sc_param > 0.01f) {
+		_config.fwd_thr_sc = sc_param;
+
+	} else {
+		const float ax = math::max(fabsf(_external.caThrusterAx()), 0.05f);
+		const float az = fabsf(_external.caThrusterAz());
+		// 4 个升力桨 + 2 个推力桨，推力桨竖直分量只有 |AZ| 那么多
+		static constexpr float kNlift = 4.f;
+		static constexpr float kNthr = 2.f;
+		_config.fwd_thr_sc = _external.mpcThrHover() * (kNlift + kNthr * az) / ax;
+	}
 }
 
 // ===========================================================================
@@ -520,7 +551,7 @@ void MyMission::Run()
 	const bool transit_assist = ((_state == State::Forward) || (_state == State::Return))
 				    && !_decel_latched;
 	const bool assist_allowed = (_state == State::Tilt) || transit_assist;
-	_output.publishAssist(assist_allowed, now);
+	_output.publishAssist(assist_allowed, _config.fwd_thr_sc, now);
 
 	// ---- 2) 安全兜底 ----
 	// 只有"正在起飞 / 前飞 / 绳段 / 低头 / 悬停"时，掉出 Offboard 或上锁才算异常，
@@ -659,10 +690,11 @@ void MyMission::stateWait(const Tick &tick)
 			_tilt_ff = 0.f;
 			_last_rope_log = 0;
 			enterState(State::Tilt, tick.now);
-			PX4_INFO("my_mission: manual entry %.2f m from %s (%.2f m above ground) -> PULL %.1f deg, %.1f s",
+			PX4_INFO("my_mission: manual entry %.2f m from %s (%.2f m above ground) -> PULL %.1f deg, %.1f s, thrusters %.0f%%",
 				 (double)dist_home, home_valid ? "home" : "current position",
 				 (double)(_ground_z - here(2)),
-				 (double)_config.pitch_down_deg, (double)_config.tilt_hold);
+				 (double)_config.pitch_down_deg, (double)_config.tilt_hold,
+				 (double)(_config.fwd_thr * 100.f));
 
 		} else {
 			// 正常流程：在 home 正上方起飞，高度 = home 的地面 + MYM_ALT。
@@ -812,15 +844,21 @@ void MyMission::stateTilt(const Tick &tick)
 			 (double)_config.pitch_down_deg, (double)_external.mpcTiltmaxAir());
 	}
 
-	// ---- 倾角 + 油门 -> 加速度前馈 ----
+	// ---- 倾角 + 推力 -> 加速度前馈 ----
 	// 和 PositionControl 那套互为逆运算：
 	//     需求角 = atan(a / g)，夹在低头上限 ceiling
-	//     缺额   = tan(需求角) - tan(ceiling)，乘 MYM_FWD_THR_SC 就是归一化前推力
+	//     缺额   = tan(需求角) - tan(ceiling)，乘 SC 就是归一化前推力
 	// 所以反过来解：
-	//     油门 = 0  -> a = g * tan(MYR_PITCH_DOWN)                        姿态 = 你给的角度
-	//     油门 > 0  -> a = g * ( tan(ceiling) + 油门 / SC )               姿态 = ceiling，推进电机 = 油门
-	const float sc = _external.mymFwdThrSc();
-	const float thr = math::constrain(_config.fwd_thr, 0.f, 1.f);
+	//     推力 = 0  -> a = g * tan(MYR_PITCH_DOWN)                     姿态 = 你给的角度
+	//     推力 > 0  -> a = g * ( tan(ceiling) + 推力 / SC )            姿态 = ceiling，推进电机出力
+	//
+	// **MYR_FWD_THR 是油门（转速百分比），不是推力占比。** 两者差一个平方根，
+	// 因为 THR_MDL_FAC = 1 时推力 ∝ 转速²：
+	//     推力占比 = MYR_FWD_THR²
+	// 所以填 0.45 和以前的"推力占比 0.2"是同一个力。
+	const float sc = math::max(_config.fwd_thr_sc, 0.05f);   // 0 = 自动算，已由 refreshConfig() 解析
+	const float thr_throttle = math::constrain(_config.fwd_thr, 0.f, 1.f);
+	const float thr = thr_throttle * thr_throttle;            // 油门 -> 推力占比
 
 	float ceiling_deg = _external.mpcTiltmaxAir();
 	const float assist_ceiling_deg = -_external.mymPitchMin();   // MYM_PITCH_MIN < 0
@@ -831,13 +869,13 @@ void MyMission::stateTilt(const Tick &tick)
 
 	// 油门一给，姿态必然被夹在上限，倾角参数就没意义了 —— 这和"角度慢慢加"的
 	// 用法一致：油门留 0，只调 MYR_PITCH_DOWN。
-	const float pitch_used = (thr > 1e-3f) ? ceiling_deg
+	const float pitch_used = (thr_throttle > 1e-3f) ? ceiling_deg
 				 : math::min(pitch_down, ceiling_deg);
 
-	if ((thr > 1e-3f) && (sc < 0.01f) && !_pitch_clamped_warned) {
+	if ((thr_throttle > 1e-3f) && (sc < 0.01f) && !_pitch_clamped_warned) {
 		_pitch_clamped_warned = true;
 		PX4_WARN("my_mission: MYR_FWD_THR %.2f needs MYM_FWD_THR_SC > 0 (got %.3f), throttle ignored",
-			 (double)thr, (double)sc);
+			 (double)thr_throttle, (double)sc);
 	}
 
 	const float a_full = CONSTANTS_ONE_G * (tanf(math::radians(pitch_used))
@@ -925,8 +963,8 @@ void MyMission::stateTilt(const Tick &tick)
 
 		// along  = 沿线（前后）走了多远，就是绳被拉出去的量
 		// lateral= 横向偏了多少，位置环应该把它压回 0
-		PX4_INFO("my_mission: TILT demand %.1f deg (a_ff %.2f, thr %.0f%%), actual %.1f deg, alt %.2f m, along %.2f m, lat %.2f m",
-			 (double)pitch_used, (double)_tilt_ff, (double)(thr * 100.f), (double)pitch_real,
+		PX4_INFO("my_mission: TILT demand %.1f deg (a_ff %.2f, thr %.0f%% -> %.0f%% thrust), actual %.1f deg, alt %.2f m, along %.2f m, lat %.2f m",
+			 (double)pitch_used, (double)_tilt_ff, (double)(thr_throttle * 100.f), (double)(thr * 100.f), (double)pitch_real,
 			 (double)(-here(2)), (double)off_origin.dot(pull_dir),
 			 (double)off_origin.dot(matrix::Vector2f(-pull_dir(1), pull_dir(0))));
 	}
@@ -1222,9 +1260,10 @@ int MyMission::print_status()
 	_local_pos_sub.copy(&local_pos);
 	const matrix::Vector3f here(local_pos.x, local_pos.y, local_pos.z);
 
-	PX4_INFO("rope pull: pitch_down %.1f deg, hold %.1f s, thr %.0f%% (entered when airborne)",
+	PX4_INFO("rope pull: pitch_down %.1f deg, hold %.1f s, thruster throttle %.0f%% (= %.0f%% thrust), sc %.3f",
 		 (double)_config.pitch_down_deg, (double)_config.tilt_hold,
-		 (double)(_config.fwd_thr * 100.f));
+		 (double)(_config.fwd_thr * 100.f), (double)(_config.fwd_thr * _config.fwd_thr * 100.f),
+		 (double)_config.fwd_thr_sc);
 
 	// 接管安全：现在把模式开关拨出 Offboard 会不会掉高度？
 	manual_control_setpoint_s manual_control{};

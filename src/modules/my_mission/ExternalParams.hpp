@@ -103,9 +103,23 @@ public:
 	 *
 	 * TILT 段靠它把 MYR_FWD_THR 反解成加速度，和辅助正向用的必须是同一个值。
 	 *
-	 * @return MYM_FWD_THR_SC（默认 0.44）
+	 * @return MYM_FWD_THR_SC；填 0 表示自动算（见 MyMission::refreshConfig）
 	 */
 	float mymFwdThrSc() const { return value(MymFwdThrSc); }
+
+	// ---- 自动算 MYM_FWD_THR_SC 需要的机体物理量 ----
+
+	/// @return MPC_THR_HOVER，悬停时的总距占比
+	float mpcThrHover() const { return value(MpcThrHover); }
+
+	/// @return CA_ROTOR0_CT，单个升力桨满油门推力 [N]
+	float caRotorCt() const { return value(CaRotorCt); }
+
+	/// @return CA_ROTOR4_AX，推力桨推力轴在机体 x 上的分量
+	float caThrusterAx() const { return value(CaThrusterAx); }
+
+	/// @return CA_ROTOR4_AZ，推力桨推力轴在机体 z（向下）上的分量，通常是负值
+	float caThrusterAz() const { return value(CaThrusterAz); }
 
 private:
 	enum Index {
@@ -119,6 +133,10 @@ private:
 		MpcTiltmaxAir,
 		MymPitchMin,
 		MymFwdThrSc,
+		MpcThrHover,
+		CaRotorCt,
+		CaThrusterAx,
+		CaThrusterAz,
 		Count
 	};
 
@@ -146,5 +164,9 @@ private:
 		{"MPC_TILTMAX_AIR",  PARAM_INVALID, 45.0f},
 		{"MYM_PITCH_MIN",    PARAM_INVALID, -15.0f},
 		{"MYM_FWD_THR_SC",   PARAM_INVALID, 0.44f},
+		{"MPC_THR_HOVER",    PARAM_INVALID, 0.25f},
+		{"CA_ROTOR0_CT",     PARAM_INVALID, 40.0f},
+		{"CA_ROTOR4_AX",     PARAM_INVALID, 0.94f},
+		{"CA_ROTOR4_AZ",     PARAM_INVALID, -0.342f},
 	};
 };
