@@ -121,20 +121,19 @@ public:
 	void setTiltLimit(const float tilt) { _lim_tilt = tilt; }
 
 	/**
-	 * Enable and configure the forward-thrust assist (multirotor with forward-facing thrusters).
+	 * 打开并配置前推力辅助（带前向推力桨的多旋翼，即 4+2 构型）。
 	 *
-	 * When the demanded pitch is more nose-down than @p pitch_min, the output attitude is clamped
-	 * to @p pitch_min and the horizontal force that the shallower attitude can no longer produce is
-	 * handed to the forward thrusters through vehicle_attitude_setpoint.thrust_body[0]
-	 * (see getAttitudeSetpoint()). The rest of the vehicle keeps working exactly as before: the
-	 * vertical loop still holds altitude and the allocator still balances the torques.
+	 * 需求俯仰比 @p pitch_min 更低头时，输出姿态被钉在 @p pitch_min，浅姿态已经产生
+	 * 不了的那部分水平力通过 vehicle_attitude_setpoint.thrust_body[0] 交给前向推力桨
+	 * （见 getAttitudeSetpoint()）。飞机其余部分行为完全不变：竖直通道照样保持高度，
+	 * 分配器照样配平力矩。
 	 *
-	 * Disabled by default, and when disabled the attitude setpoint is bit-identical to before.
+	 * 默认关闭；关闭时输出的姿态给定和加这个功能之前**逐字节一致**。
 	 *
-	 * @param enable      false leaves the output untouched
-	 * @param pitch_min   nose-down pitch ceiling [rad], negative (e.g. radians(-15)). 0 disables the clamp
-	 * @param sc          missing-horizontal-force [N] to normalized forward thrust conversion
-	 * @param thrust_max  upper bound of the normalized forward thrust [0,1]
+	 * @param enable      false = 完全不动输出
+	 * @param pitch_min   低头上限 [rad]，取负值（例如 radians(-15)）；0 = 不做夹紧
+	 * @param sc          "缺掉的水平力 [N] -> 归一化前推力"的换算系数
+	 * @param thrust_max  归一化前推力的上限 [0,1]
 	 */
 	void setForwardThrust(const bool enable, const float pitch_min, const float sc, const float thrust_max)
 	{
@@ -240,14 +239,13 @@ private:
 	float _lim_thr_xy_margin{}; ///< Margin to keep for horizontal control when saturating prioritized vertical thrust
 	float _lim_tilt{}; ///< Maximum tilt from level the output attitude is allowed to have
 
-	// Forward-thrust assist: when the demanded pitch goes below _pitch_min, the attitude is clamped
-	// and the resulting force deficit is routed to the forward thrusters (thrust_body[0]).
-	float _fwd_thrust{0.f}; ///< Normalized forward thrust written to thrust_body[0], [0,1]
-	bool _fwd_thrust_en{false}; ///< Assist enabled (default off: output unchanged)
-	float _pitch_min{0.f}; ///< Nose-down pitch ceiling [rad], negative; below it the deficit becomes forward thrust
-	float _fwd_thrust_sc{0.f}; ///< Missing horizontal force [N] -> normalized forward thrust
-	float _fwd_thrust_max{0.5f}; ///< Upper bound of the normalized forward thrust
-	matrix::Vector2f _fwd_acc_xy{}; ///< Horizontal acceleration [m/s^2] the forward thrusters add; not part of _thr_sp
+	// 前推力辅助：需求俯仰低于 _pitch_min 时，姿态被钉在上限，缺额转成前推力（thrust_body[0]）。
+	float _fwd_thrust{0.f}; ///< 写进 thrust_body[0] 的归一化前推力，[0,1]
+	bool _fwd_thrust_en{false}; ///< 辅助是否启用（默认关：输出不变）
+	float _pitch_min{0.f}; ///< 低头上限 [rad]，负值；需求比它更低头时，缺额变成前推力
+	float _fwd_thrust_sc{0.f}; ///< 缺掉的水平力 [N] -> 归一化前推力
+	float _fwd_thrust_max{0.5f}; ///< 归一化前推力的上限
+	matrix::Vector2f _fwd_acc_xy{}; ///< 前向推力桨额外贡献的水平加速度 [m/s^2]；不含在 _thr_sp 里
 
 	float _hover_thrust{}; ///< Thrust [HOVER_THRUST_MIN, HOVER_THRUST_MAX] with which the vehicle hovers not accelerating down or up with level orientation
 	bool _decouple_horizontal_and_vertical_acceleration{true}; ///< Ignore vertical acceleration setpoint to remove its effect on the tilt setpoint

@@ -201,10 +201,12 @@ private:
 	uORB::Subscription _vehicle_torque_setpoint1_sub{ORB_ID(vehicle_torque_setpoint), 1};  /**< vehicle torque setpoint subscription (2. instance) */
 	uORB::Subscription _vehicle_thrust_setpoint1_sub{ORB_ID(vehicle_thrust_setpoint), 1};	 /**< vehicle thrust setpoint subscription (2. instance) */
 
-	// Normalised per-motor trim added straight to the allocated motor outputs. This exists because
-	// some actuators are deliberately left out of the effectiveness matrix (a thruster pair whose
-	// yaw lever arm is not modelled, for instance) and therefore cannot be reached by any control
-	// setpoint: their differential sits in the null space of the allocation.
+	/**
+	 * 归一化的逐电机 trim，直接叠加到分配出来的电机输出上。
+	 *
+	 * 存在的理由：有些执行器被刻意留在有效性矩阵之外（比如一对不建模偏航力臂的推力桨），
+	 * 任何控制给定都到不了它们 —— 它们的差动落在分配的零空间里。
+	 */
 	uORB::Subscription _actuator_motors_trim_sub{ORB_ID(actuator_motors_trim)};
 
 	// Outputs

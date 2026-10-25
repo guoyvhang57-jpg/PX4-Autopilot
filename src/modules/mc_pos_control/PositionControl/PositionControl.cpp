@@ -220,18 +220,17 @@ void PositionControl::_accelerationControl()
 
 	Vector3f body_z = Vector3f(-_acc_sp(0), -_acc_sp(1), -z_specific_force).normalized();
 
-	// --- Forward-thrust assist ---------------------------------------------------------------
-	// body_z is the direction of the body z axis in the local frame (it points down when level),
-	// so a nose-down demand gives body_z(0) < 0. If the demanded pitch is steeper than the ceiling
-	// we clamp the attitude there and turn the force deficit into forward thrust for the thrusters.
+	// --- 前推力辅助 ---
+	// body_z 是机体系 z 轴在本地系里的方向（水平时它指向下方），所以"低头"的需求表现为
+	// body_z(0) < 0。需求俯仰比上限更陡时，就把姿态钉在上限，把缺掉的那部分水平力
+	// 交给前向推力桨。
 	//
-	// The horizontal force of a tilted multirotor is (vertical force) * tan(pitch), so the deficit
-	// is a tan() difference, not the sin() difference used by VtolType::pusher_assist(): the sine
-	// version underestimates the missing force by ~18% at the operating points we care about
-	// (24 deg demand vs 15 deg clamp: tan gives 7.30 N, sin gives 6.05 N).
+	// 倾斜多旋翼的水平力是 (竖直力) * tan(俯仰)，所以缺额要用 tan 的差，不能照抄
+	// VtolType::pusher_assist() 里的 sin 差 —— 在我们关心的工况上 sin 版会低估约 18%
+	// （需求 24° / 上限 15°：tan 给 7.30 N，sin 只给 6.05 N）。
 	//
-	// Keep the unlimited direction: MPC_TILTMAX_AIR may already have truncated the demand and the
-	// deficit has to be measured against what was actually asked for, not against the truncation.
+	// 这里要先留一份**没被 MPC_TILTMAX_AIR 截断**的方向：缺额必须按"真正要求了多少"
+	// 来算，不能按截断后的角度算。
 	const Vector3f body_z_raw = body_z;
 
 	ControlMath::limitTilt(body_z, Vector3f(0, 0, 1), _lim_tilt);
@@ -239,32 +238,32 @@ void PositionControl::_accelerationControl()
 	_fwd_thrust = 0.f;
 	_fwd_acc_xy.setZero();
 
-	// Effective nose-down ceiling: the tighter of MPC_PITCH_MIN and -MPC_TILTMAX_AIR, so the assist
-	// can never loosen a limit that MPC_TILTMAX_AIR already imposed.
+	// 实际生效的低头上限：MYM_PITCH_MIN 和 -MPC_TILTMAX_AIR 里更严的那个。
+	// 这样辅助**永远不可能放宽** MPC_TILTMAX_AIR 已经施加的限制。
 	const float pitch_ceiling = math::max(_pitch_min, -_lim_tilt);
 
 	if (_fwd_thrust_en && (pitch_ceiling < 0.f) && (body_z_raw.norm_squared() > FLT_EPSILON)) {
-		// _yaw_sp is only sanitised after _velocityControl() returns, so fall back to the state.
+		// _yaw_sp 要等 _velocityControl() 返回后才做合法性检查，这里先退回状态估计的航向。
 		const float yaw_ref = PX4_ISFINITE(_yaw_sp) ? _yaw_sp : _yaw;
 		const float cy = cosf(yaw_ref);
 		const float sy = sinf(yaw_ref);
 
-		// Rotate into the heading frame: the x component is the along-heading (pitch) part
-		const float x_h = cy * body_z_raw(0) + sy * body_z_raw(1);   // along the heading
-		const float z_h = body_z_raw(2);                             // downwards
+		// 转到航向坐标系：x 分量就是沿机头方向（俯仰）的那一部分
+		const float x_h = cy * body_z_raw(0) + sy * body_z_raw(1);   // 沿机头
+		const float z_h = body_z_raw(2);                             // 向下
 
-		const float pitch = atan2f(x_h, z_h);                        // negative = nose down
+		const float pitch = atan2f(x_h, z_h);                        // 负 = 低头
 
 		if (pitch < pitch_ceiling) {
-			// Missing horizontal force: |tan(pitch)| - |tan(ceiling)|.
-			// Both angles are negative, so negate to work with the magnitudes.
+			// 缺掉的水平力 = |tan(需求角)| - |tan(上限角)|。
+			// 两个角都是负数，取负号换成绝对值来算。
 			const float deficit = tanf(-pitch) - tanf(-pitch_ceiling);
 			_fwd_thrust = math::constrain(deficit * _fwd_thrust_sc, 0.f, _fwd_thrust_max);
 
-			// Rebuild body_z with the pitch clamped, keeping roll and heading. In the heading frame
-			// the body z axis is (sin(pitch)*cos(roll), -sin(roll), cos(pitch)*cos(roll)), unit
-			// length. Take the roll from the already tilt-limited vector so the rebuild cannot
-			// reintroduce tilt that MPC_TILTMAX_AIR just removed.
+			// 把俯仰钉在上限、保留滚转和航向，重建 body_z。在航向坐标系里机体 z 轴是
+			// (sin(pitch)*cos(roll), -sin(roll), cos(pitch)*cos(roll))，单位长度。
+			// 滚转要取自**已经被限幅过**的那个向量，否则重建会把 MPC_TILTMAX_AIR
+			// 刚削掉的倾斜角又带回来。
 			const float y_lim = -sy * body_z(0) + cy * body_z(1);
 			const float roll = -asinf(math::constrain(y_lim, -1.f, 1.f));
 			const float cos_roll = cosf(roll);
@@ -277,30 +276,29 @@ void PositionControl::_accelerationControl()
 			body_z(1) = sy * x_n + cy * y_n;
 			body_z(2) = z_n;
 
-			// Safety net: roll plus a shallow pitch can still exceed the absolute tilt limit
-			// (e.g. MPC_PITCH_MIN looser than MPC_TILTMAX_AIR), so re-apply it.
+			// 兜底：滚转叠加一个浅俯仰仍可能超过总的倾角上限
+			// （比如 MYM_PITCH_MIN 比 MPC_TILTMAX_AIR 更宽松），所以再夹一次。
 			ControlMath::limitTilt(body_z, Vector3f(0, 0, 1), _lim_tilt);
 
-			// Horizontal acceleration the forward thrusters contribute. _thr_sp (below) only covers
-			// the tilt, so without this the anti-windup in _velocityControl() sees a shortfall that
-			// does not exist and freezes the velocity integrator: measured, a 15 m/s setpoint stalled
-			// at 13.6 m/s against a phantom 1.26 m/s^2 gap.
+			// 前向推力桨贡献的水平加速度。下面的 _thr_sp 只包含**倾角**那一份，不加这一项的话
+			// _velocityControl() 里的抗积分饱和会看到一个根本不存在的缺额，把速度积分器冻住：
+			// 实测 15 m/s 的给定卡在 13.6 m/s，对着一个虚构的 1.26 m/s^2 缺口。
 			//
-			// thrust_body[0] maps to a body-x force through K_F and SC = m*g/K_F, so g/SC is the
-			// body-x acceleration per unit of thrust_body[0] -- no separate calibration needed.
+			// thrust_body[0] 通过 K_F 和 SC = m*g/K_F 映射到机体系 x 方向的力，所以 g/SC 就是
+			// 每单位 thrust_body[0] 对应的机体系 x 加速度 —— 不需要另外标定。
 			//
-			// No tilt projection. a_body_x is by construction exactly the deficit this assist was
-			// asked to fill (_fwd_thrust = (tan(pitch_demand) - tan(ceiling)) * SC, so
-			// a_body_x = a_desired - a_tilt), which makes acc_sp_xy_produced equal a_desired whenever
-			// the thrusters are not clipped -- which is the correct statement of "not saturated".
-			// Projecting by cos(pitch) would instead under-count: the thrusters push along an axis
-			// mounted ~20 deg above body x, so their true horizontal share at 15 deg pitch is
-			// cos(pitch) + (AZ/AX)*sin(pitch) = 1.06, not 0.966. That phantom gap left a 0.07 m/s
-			// residual (simulated 14.93 m/s against a 15 m/s setpoint).
+			// **不要乘倾角投影。** a_body_x 按构造就等于这个辅助要补的缺额
+			// （_fwd_thrust = (tan(需求角) - tan(上限角)) * SC，于是
+			//   a_body_x = a_需求 - a_倾角），
+			// 只要推力桨没被限幅，acc_sp_xy_produced 就正好等于 a_需求 —— 这才是
+			// "没饱和"的正确表述。乘 cos(pitch) 反而会少算：推力桨的推力轴装在机体系 x 上方
+			// 约 20°，15° 俯仰时它们真正的水平份额是
+			// cos(pitch) + (AZ/AX)*sin(pitch) = 1.06，不是 0.966；
+			// 那个虚构的缺口留下过 0.07 m/s 的稳态残差（仿真里 14.93 m/s 对 15 m/s 的给定）。
 			//
-			// Once the assist clips at MYM_FWD_THR_MAX, a_body_x stops growing and
-			// acc_sp_xy_produced falls below a_desired, so the anti-windup still engages exactly when
-			// it should. The 0.342 vertical part of the thrust axis is left to the z integrator.
+			// 一旦辅助被 MYM_FWD_THR_MAX 限住，a_body_x 就不再增长，acc_sp_xy_produced 会掉到
+			// a_需求以下，抗积分饱和该介入的时刻它就介入了。推力轴那 0.342 的竖直分量
+			// 留给 z 通道的积分器处理。
 			if (_fwd_thrust_sc > FLT_EPSILON) {
 				const float a_body_x = _fwd_thrust * CONSTANTS_ONE_G / _fwd_thrust_sc;
 				_fwd_acc_xy = Vector2f(cy, sy) * a_body_x;
@@ -363,11 +361,10 @@ void PositionControl::getAttitudeSetpoint(vehicle_attitude_setpoint_s &attitude_
 	ControlMath::thrustToAttitude(_thr_sp, _yaw_sp, attitude_setpoint);
 	attitude_setpoint.yaw_sp_move_rate = _yawspeed_sp;
 
-	// Forward thrust for the front-facing thrusters, computed in _accelerationControl().
-	// thrust_body is normalised per axis by the allocator (ControlAllocationPseudoInverse divides
-	// every thrust axis by the mean magnitude of its pseudo-inverse column), so this is NOT a force
-	// in Newtons -- 1.0 means "the actuators that produce body-x force at full scale".
-	// thrustToAttitude() only writes thrust_body[2] and the struct is zero initialised, so with
-	// _fwd_thrust == 0 (assist disabled) the output is byte-identical to before this feature.
+	// 前向推力桨的推力，数值在 _accelerationControl() 里算好。
+	// thrust_body 由分配器**逐轴归一化**（ControlAllocationPseudoInverse 会把每个推力轴除以
+	// 它对应伪逆列的平均模长），所以这里的 1.0 不是 1 N，而是"产生机体系 x 向力的那些执行器
+	// 满量程"。thrustToAttitude() 只写 thrust_body[2]，结构体又是零初始化，所以
+	// _fwd_thrust == 0（辅助关闭）时输出和加这个功能之前**逐字节一致**。
 	attitude_setpoint.thrust_body[0] = _fwd_thrust;
 }

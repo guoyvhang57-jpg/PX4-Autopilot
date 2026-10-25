@@ -433,14 +433,13 @@ ControlAllocator::Run()
 			// Do allocation
 			_control_allocation[i]->allocate();
 
-			// External per-motor trim, applied before the auxiliary controls and the clip so that it
-			// obeys the same actuator limits and slew rate as everything else. Needed because some
-			// actuators are deliberately kept out of the effectiveness matrix, which puts their
-			// differential in the null space of the allocation where no control setpoint can reach it.
+			// 外部逐电机 trim，在辅助控制（襟翼/扰流板）和限幅**之前**叠加，这样它和其他
+			// 一切输出一样受执行器上下限和斜率限制。之所以需要它：有些执行器被刻意留在
+			// 有效性矩阵之外，它们的差动因此落在分配的**零空间**里，任何控制给定都到不了那里。
 			if (i == 0) {
 				actuator_motors_trim_s motors_trim{};
 
-				// ignore a stale trim rather than holding the last one forever
+				// 过期的 trim 直接忽略，而不是一直保持最后一份
 				if (_actuator_motors_trim_sub.copy(&motors_trim) && hrt_elapsed_time(&motors_trim.timestamp) < 100_ms) {
 					int num_motors = _num_actuators[0];
 

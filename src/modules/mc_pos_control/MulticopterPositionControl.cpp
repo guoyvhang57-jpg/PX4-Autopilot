@@ -538,17 +538,14 @@ void MulticopterPositionControl::Run()
 						     ? _param_mpc_tiltmax_lnd.get() : _param_mpc_tiltmax_air.get();
 			_control.setTiltLimit(_tilt_limit_slew_rate.update(math::radians(tilt_limit_deg), dt));
 
-			// Forward-thrust assist: clamp the nose-down pitch to MYM_PITCH_MIN and hand the force
-			// deficit to the forward-facing thrusters.
+			// 前推力辅助：把低头角夹在 MYM_PITCH_MIN 以内，缺掉的力交给前向推力桨。
 			//
-			// Offboard only. This is an airframe-specific, experimental feature, so it is scoped to
-			// the offboard mission instead of changing how every position-controlled mode feels --
-			// otherwise POSCTL/ALTCTL/AUTO would inherit the MYM_PITCH_MIN nose-down ceiling too.
-			// Outside Offboard the assist is off and MYM_PITCH_MIN goes unused.
+			// **只在 Offboard 下生效。** 这是特定机型的实验性功能，所以被限定在 Offboard 任务里，
+			// 不去改变其他所有位置控制模式的手感 —— 否则 POSCTL / ALTCTL / AUTO 也会继承
+			// MYM_PITCH_MIN 这个低头上限。离开 Offboard 辅助就关闭，MYM_PITCH_MIN 不起作用。
 			//
-			// The gate lives here and not in PositionControl because that class is a pure control law
-			// with no access to the flight mode. It also ignores a non-negative MYM_PITCH_MIN, so a
-			// misconfiguration cannot force a nose-up attitude.
+			// 门控放在这里而不是 PositionControl，因为那个类只是纯控制律，拿不到飞行模式。
+			// 它同时会忽略非负的 MYM_PITCH_MIN，所以参数配错也不会把姿态强行变成抬头。
 			_control.setForwardThrust(_param_mym_fwd_thr_en.get() != 0
 						  && _vehicle_control_mode.flag_control_offboard_enabled
 						  && _assist_enabled_by_mission,

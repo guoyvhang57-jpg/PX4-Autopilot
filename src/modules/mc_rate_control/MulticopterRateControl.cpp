@@ -226,16 +226,14 @@ MulticopterRateControl::Run()
 			rate_ctrl_status_s rate_ctrl_status{};
 			_rate_control.getRateControlStatus(rate_ctrl_status);
 
-			// Yaw authority split. The allocator is deliberately blind to the thrusters' yaw lever arm
-			// (CA_ROTORn_PY = 0), which puts their differential in the null space of the allocation:
-			// no torque setpoint can reach it. Route the yaw integrator there through the motor trim
-			// topic and subtract exactly what is handed over, so the two contributions always sum to
-			// the demand.
+			// 偏航权限的分配。分配器被刻意蒙住了推力桨的偏航力臂（CA_ROTORn_PY = 0），
+			// 于是它们的差动落在分配的**零空间**里：任何力矩给定都到不了那里。
+			// 这里把偏航积分通过电机 trim 主题送过去，并从力矩给定里**减去同样多**，
+			// 保证两份贡献加起来始终等于需求。
 			//
-			// The pair can only absorb what its headroom allows, and whatever does not fit stays with
-			// the lift rotors. That makes the split continuous in throttle and degrades to the
-			// unmodified behaviour when the thrusters are off or saturated, so there is no switching
-			// point to get wrong.
+			// 这一对桨只能吸收它余量允许的部分，装不下的仍然留在升力桨上。
+			// 于是这个划分随油门**连续**变化，推力桨关掉或饱和时自动退回改动前的行为，
+			// 不存在"切换点"可以搞错。
 			actuator_motors_trim_s motors_trim{};
 			const float yaw_diff_gain = _param_mc_yaw_diff_gain.get();
 
@@ -249,72 +247,62 @@ MulticopterRateControl::Run()
 				    && act1 != act2
 				    && _actuator_motors_sub.copy(&motors)) {
 
-					// Headroom of the pair in actuator units. Use the pair's mean rather than the raw
-					// readback: the readback already contains last cycle's trim, so min(u1, 1-u2) would
-					// subtract the differential from its own headroom and oscillate -- measured 0.30
-					// against 0.20 every cycle at f = 0.5 for a 0.30 demand. The trim is equal and
-					// opposite, so the mean is the untrimmed operating point.
+					// 这一对桨在执行器单位下的余量。用两者的**均值**，不要用读回来的原始值：
+					// 读回值里已经含着上一拍的 trim，所以 min(u1, 1-u2) 会拿差动去减它自己的余量，
+					// 造成振荡 —— 实测 0.30 需求的 f = 0.5 时，每拍在 0.30 和 0.20 之间来回。
+					// trim 是等幅反相的，取均值就是没加 trim 时的工作点。
 					const float u_mean = 0.5f * (motors.control[act1] + motors.control[act2]);
 
-					// The conversion is not constant. With THR_MDL_FAC the actuator command is a
-					// normalised rotor speed, so thrust goes as u^2 and the yaw torque per unit of
-					// differential is the derivative of that:
+					// 换算系数不是常数。开了 THR_MDL_FAC 之后执行器指令是**归一化转速**，
+					// 推力按 u^2 走，所以"每单位差动换来多少偏航力矩"是这个东西的导数：
 					//
 					//   d(tau)/d(diff) = 4 * PY * AX * CT * u_mean
 					//
-					// i.e. 44.7 * u_mean here: 8.5 N*m/unit at 19% throttle, 22.3 at 50%, 44.7 at
-					// 100%. MC_YAW_DIFF_GAIN is defined at u_mean = 0.5, so scale it by 0.5/u_mean.
+					// 在本机型上就是 44.7 * u_mean：19% 油门时 8.5 N·m/单位，50% 时 22.3，
+					// 100% 时 44.7。MC_YAW_DIFF_GAIN 是按 u_mean = 0.5 定义的，所以要乘 0.5/u_mean。
 					//
-					// Getting this wrong is not subtle: flying at 19% throttle with a constant gain
-					// delivered only 38% of the torque it removed, and the yaw integrator grew 2.6x to
-					// cover the hole (measured 0.046 -> 0.111 and still climbing, against 0.121
-					// predicted). The floor keeps the divide finite when the thrusters are off, where
-					// the headroom is zero anyway and nothing is handed over.
+					// 这一项算错的后果一点也不微妙：19% 油门用固定增益时，实际只交出去它减掉的
+					// 38% 的力矩，偏航积分于是涨了 2.6 倍去补这个洞（实测 0.046 -> 0.111 还在涨，
+					// 预测值 0.121）。分母那个下限是为了推力桨关掉时除法不发散 —— 那时余量本来就是 0，
+					// 什么都不会交出去。
 					const float gain_eff = yaw_diff_gain / math::max(2.f * u_mean, 0.02f);
 
 					const float headroom = math::max(0.f, math::min(u_mean, 1.f - u_mean));
 					const float max_torque = headroom / gain_eff;
 
-					// Share handed to the pair, as a proportion of its throttle. This is what makes
-					// the transfer gradual in BOTH directions without a slew limiter: the thrusters
-					// ramp up, the share ramps up; they ramp down and it ramps back, and whatever
-					// fraction is not handed over stays with the lift rotors, whose integrator then
-					// absorbs the difference on its own.
+					// 交给这一对桨的份额，按它当前油门的比例算。**这是"不用 slew limiter
+					// 也能双向平滑交接"的关键**：推力桨转速爬升，份额跟着爬升；它们降下来，
+					// 份额也退回去，没交出去的那部分仍然留在升力桨上，由后者的积分器自己吸收。
 					//
-					// Full transfer from kYawDiffFullU upwards. Below it the share falls linearly to
-					// zero, so by the time the pair is too slow to deliver anything there is nothing
-					// left to hand back -- the abrupt kick measured at the end of a leg (heading
-					// +9.7 deg in 0.5 s) was the stale part of the integral being dumped on the lift
-					// rotors in one step.
+					// kYawDiffFullU 以上是全额交接。低于它份额线性降到 0，于是等这一对桨慢到
+					// 什么都交不出来的时候，已经没有东西要退回去了 —— 实测航段末尾那一下突兀的
+					// 甩尾（0.5 s 内航向 +9.7°），就是积分里的陈货被一次性倒给升力桨造成的。
 					//
-					// 0.14 is the pair's median operating throttle across eight logs (90th percentile
-					// 0.24), so the whole integral is handed over for the entire cruise. Squared so
-					// the share falls away faster near the bottom: at 0.07 it is 0.25 instead of 0.50
-					// linear, i.e. the stale part of the integral is given back earlier, while the
-					// lift rotors still have time to absorb it instead of getting it all at once.
-					// Measured with the linear version: heading excursion per thruster stop 4.3 /
-					// 5.2 / 7.6 / 5.1 deg, against 7.2 / 11.0 / 11.9 deg all-or-nothing.
+					// 0.14 是八份日志里这一对桨的中位工作油门（90 分位 0.24），所以整个巡航段
+					// 积分都是全额交出去的。这里取**平方**，让份额在底部掉得更快：0.07 时是 0.25，
+					// 而线性版是 0.50 —— 也就是积分的陈货更早开始归还，升力桨有时间慢慢吸收，
+					// 而不是一次性接住。线性版的实测甩尾是 4.3 / 5.2 / 7.6 / 5.1 度，
+					// 全有全无版是 7.2 / 11.0 / 11.9 度。
 					static constexpr float kYawDiffFullU = 0.14f;
 					const float share = math::constrain(sq(u_mean / kYawDiffFullU), 0.f, 1.f);
 
-					// Torque handed to the pair, limited to what it can actually deliver and scaled
-					// by its throttle share.
+					// 真正交给这一对桨的力矩：先夹到它交付得出的范围内，再乘油门份额。
 					const float yaw_torque = math::constrain(rate_ctrl_status.yawspeed_integ,
 								 -max_torque, max_torque) * share;
 					const float diff = yaw_torque * gain_eff;
 
 					torque_setpoint(2) -= yaw_torque;
 
-					// A positive yaw torque (nose right in FRD) comes from raising the thruster on the
-					// left and lowering the one on the right, i.e. act2 up and act1 down, because the
-					// pair sits at -PY and +PY respectively. If the assist fights the disturbance
-					// instead of cancelling it, swap MC_YAW_DIFF_ACT1 and MC_YAW_DIFF_ACT2.
+					// 正的偏航力矩（FRD 里 = 机头右转）来自"抬左边的推力桨、压右边的"，
+					// 也就是 act2 加、act1 减 —— 因为这一对桨分别装在 -PY 和 +PY 上。
+					// 如果发现这个辅助是在**对抗**扰动而不是抵消它，就把
+					// MC_YAW_DIFF_ACT1 和 MC_YAW_DIFF_ACT2 对调。
 					motors_trim.trim[act1] = -diff;
 					motors_trim.trim[act2] = diff;
 				}
 			}
 
-			// publish every cycle, even when disabled, so a stale trim cannot linger in the allocator
+			// 每拍都发，即使没启用 —— 否则上一拍的 trim 会留在分配器里不散
 			motors_trim.timestamp = hrt_absolute_time();
 			_actuator_motors_trim_pub.publish(motors_trim);
 
