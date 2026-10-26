@@ -21,7 +21,7 @@ Offboard 位置控制的最小任务示例：**起飞到指定高度 → 向前�
 | `TransitLeg.cpp` / `.hpp` | "用 PX4 的 `PositionSmoothing` 飞到一个定点"，`FORWARD` 用它 |
 | `ExternalParams.cpp` / `.hpp` | 从别人的参数抄阈值（`MPC_*` / `MAN_DEADZONE` / `LNDMC_Z_VEL_MAX`） |
 | `TakeoverMonitor.cpp` / `.hpp` | 接管安全：飞出 Offboard 时油门没回中会掉高度 |
-| `docs/offboard.md` | Offboard 是什么、三条 topic 怎么配合、飞手操作顺序（原来压在 `MyMission.cpp` 开头的 144 行） |
+| `dos/offboard.md` | Offboard 是什么、三条 topic 怎么配合、飞手操作顺序（原来压在 `MyMission.cpp` 开头的 144 行） |
 | `my_mission_params.yaml` | `MYM_*` / `MYR_*` 参数定义 |
 | `Kconfig` | `MODULES_MY_MISSION` |
 | `CMakeLists.txt` | `px4_add_module` |

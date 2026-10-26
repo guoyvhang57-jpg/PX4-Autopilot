@@ -24,7 +24,7 @@
  * 任务编排：状态机 + 9 个状态函数。
  *
  * Offboard 是什么、三条 topic 怎么配合、飞手要按什么顺序操作、每个参数什么含义，
- * 全部在 docs/offboard.md 和 README.md 里，本文件只管"什么时候做什么"。
+ * 全部在 dos/offboard.md 和 dos/README.md 里，本文件只管"什么时候做什么"。
  *
  * 刻意留下的两条规矩：
  *   1) **只有 MissionOutput 发 topic。** trajectory_setpoint 是共享 topic，
