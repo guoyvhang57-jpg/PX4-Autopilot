@@ -152,7 +152,7 @@ void PositionControl::_velocityControl(const float dt)
 	// No control input from setpoints or corresponding states which are NAN
 	ControlMath::addIfNotNanVector3f(_acc_sp, acc_sp_velocity);
 
-	_accelerationControl();
+	_accelerationControl(dt);
 
 	// Integrator anti-windup in vertical direction
 	if ((_thr_sp(2) >= -_lim_thr_min && vel_error(2) >= 0.f) ||
@@ -208,7 +208,7 @@ void PositionControl::_velocityControl(const float dt)
 	_vel_int += vel_error.emult(_gain_vel_i) * dt;
 }
 
-void PositionControl::_accelerationControl()
+void PositionControl::_accelerationControl(const float dt)
 {
 	// Assume standard acceleration due to gravity in vertical direction for attitude generation
 	float z_specific_force = -CONSTANTS_ONE_G;
@@ -258,7 +258,18 @@ void PositionControl::_accelerationControl()
 			// 缺掉的水平力 = |tan(需求角)| - |tan(上限角)|。
 			// 两个角都是负数，取负号换成绝对值来算。
 			const float deficit = tanf(-pitch) - tanf(-pitch_ceiling);
-			_fwd_thrust = math::constrain(deficit * _fwd_thrust_sc, 0.f, _fwd_thrust_max);
+			const float thrust_target = math::constrain(deficit * _fwd_thrust_sc, 0.f, _fwd_thrust_max);
+
+			// 上升斜坡：推进电机一步到位会有冲击 —— 实测推力桨从 0 跳到 50% 油门
+			// 的那一拍，航向漂了 32°，加速度振动指标从 5 涨到 12~14。
+			// **只限制上升**：辅助一关、或者需求消失，输出必须立刻归零，
+			// 不然"关掉辅助"之后电机还会按斜坡推好几秒。目标中途变小也立刻跟随。
+			if (_fwd_thrust_slew > FLT_EPSILON) {
+				_fwd_thrust = math::min(thrust_target, _fwd_thrust_prev + _fwd_thrust_slew * dt);
+
+			} else {
+				_fwd_thrust = thrust_target;
+			}
 
 			// 把俯仰钉在上限、保留滚转和航向，重建 body_z。在航向坐标系里机体 z 轴是
 			// (sin(pitch)*cos(roll), -sin(roll), cos(pitch)*cos(roll))，单位长度。
@@ -305,6 +316,10 @@ void PositionControl::_accelerationControl()
 			}
 		}
 	}
+
+	// 斜坡的起点存给下一拍。辅助没跑（关闭 / 无可算的缺额）时这里是 0，
+	// 所以每次重新投入都从 0 爬起来，不会残留上一次的推力。
+	_fwd_thrust_prev = _fwd_thrust;
 
 	// Convert to thrust assuming hover thrust produces standard gravity
 	const float thrust_ned_z = _acc_sp(2) * (_hover_thrust / CONSTANTS_ONE_G) - _hover_thrust;

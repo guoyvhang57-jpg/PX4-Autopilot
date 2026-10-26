@@ -203,7 +203,8 @@ private:
 		(ParamInt<px4::params::MYM_FWD_THR_EN>)   _param_mym_fwd_thr_en,
 		(ParamFloat<px4::params::MYM_PITCH_MIN>)     _param_mym_pitch_min,
 		(ParamFloat<px4::params::MYM_FWD_THR_SC>) _param_mym_fwd_thr_sc,
-		(ParamFloat<px4::params::MYM_FWD_THR_MAX>) _param_mym_fwd_thr_max
+		(ParamFloat<px4::params::MYM_FWD_THR_MAX>) _param_mym_fwd_thr_max,
+		(ParamFloat<px4::params::MYM_FWD_THR_SLEW>) _param_mym_fwd_thr_slew
 	);
 
 	math::WelfordMean<float> _sample_interval_s{};

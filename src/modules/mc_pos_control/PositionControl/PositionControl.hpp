@@ -134,13 +134,17 @@ public:
 	 * @param pitch_min   低头上限 [rad]，取负值（例如 radians(-15)）；0 = 不做夹紧
 	 * @param sc          "缺掉的水平力 [N] -> 归一化前推力"的换算系数
 	 * @param thrust_max  归一化前推力的上限 [0,1]
+	 * @param slew        前推力的上升斜率 [1/s]，0 = 不限制（默认）。只限制上升：
+	 *                    辅助关闭或需求消失时输出立刻归零，不走斜坡
 	 */
-	void setForwardThrust(const bool enable, const float pitch_min, const float sc, const float thrust_max)
+	void setForwardThrust(const bool enable, const float pitch_min, const float sc, const float thrust_max,
+			      const float slew = 0.f)
 	{
 		_fwd_thrust_en = enable;
 		_pitch_min = pitch_min;
 		_fwd_thrust_sc = sc;
 		_fwd_thrust_max = thrust_max;
+		_fwd_thrust_slew = slew;
 	}
 
 	/**
@@ -222,7 +226,7 @@ private:
 
 	void _positionControl(); ///< Position proportional control
 	void _velocityControl(const float dt); ///< Velocity PID control
-	void _accelerationControl(); ///< Acceleration setpoint processing
+	void _accelerationControl(const float dt); ///< Acceleration setpoint processing
 
 	// Gains
 	matrix::Vector3f _gain_pos_p; ///< Position control proportional gain
@@ -245,6 +249,8 @@ private:
 	float _pitch_min{0.f}; ///< 低头上限 [rad]，负值；需求比它更低头时，缺额变成前推力
 	float _fwd_thrust_sc{0.f}; ///< 缺掉的水平力 [N] -> 归一化前推力
 	float _fwd_thrust_max{0.5f}; ///< 归一化前推力的上限
+	float _fwd_thrust_slew{0.f}; ///< 前推力的上升斜率 [1/s]；0 = 不限制
+	float _fwd_thrust_prev{0.f}; ///< 上一拍输出的前推力，上升斜坡的起点
 	matrix::Vector2f _fwd_acc_xy{}; ///< 前向推力桨额外贡献的水平加速度 [m/s^2]；不含在 _thr_sp 里
 
 	float _hover_thrust{}; ///< Thrust [HOVER_THRUST_MIN, HOVER_THRUST_MAX] with which the vehicle hovers not accelerating down or up with level orientation

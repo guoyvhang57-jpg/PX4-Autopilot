@@ -421,3 +421,46 @@ TEST_F(PositionControlBasicTest, IntegratorWindupWithInvalidSetpoint)
 	EXPECT_FLOAT_EQ(euler_att.phi(), 0.f);
 	EXPECT_FLOAT_EQ(euler_att.theta(), 0.f);
 }
+
+TEST_F(PositionControlBasicTest, ForwardThrustRamp)
+{
+	// GIVEN: a demand of 5 m/s^2 forward, which is ~27 deg of pitch and therefore
+	// past the 15 deg nose-down ceiling of the assist
+	_input_setpoint.acceleration[0] = 5.f;
+	_input_setpoint.acceleration[1] = 0.f;
+	_input_setpoint.acceleration[2] = 0.f;
+	_position_control.setForwardThrust(true, math::radians(-15.f), 1.f, 1.f, 0.f);
+
+	// WHEN: the assist is not sloped, THEN the output goes straight to the target
+	EXPECT_TRUE(runController());
+	const float target = _attitude.thrust_body[0];
+	EXPECT_GT(target, 0.2f);
+	EXPECT_LT(target, 0.25f);   // tan(27deg) - tan(15deg) = 0.24
+
+	// WHEN: the assist is switched off, THEN the output drops immediately
+	_position_control.setForwardThrust(false, math::radians(-15.f), 1.f, 1.f, 0.f);
+	EXPECT_TRUE(runController());
+	EXPECT_EQ(_attitude.thrust_body[0], 0.f);
+
+	// WHEN: the assist is re-enabled with a slope of 0.05/s, THEN it climbs by
+	// 0.05 * 0.1 s = 0.005 per cycle, starting from zero
+	_position_control.setForwardThrust(true, math::radians(-15.f), 1.f, 1.f, 0.05f);
+
+	EXPECT_TRUE(runController());
+	EXPECT_NEAR(_attitude.thrust_body[0], 0.005f, 1e-4f);
+
+	EXPECT_TRUE(runController());
+	EXPECT_NEAR(_attitude.thrust_body[0], 0.010f, 1e-4f);
+
+	// THEN: it saturates at the target instead of overshooting it
+	for (int i = 0; i < 60; i++) {
+		EXPECT_TRUE(runController());
+	}
+
+	EXPECT_NEAR(_attitude.thrust_body[0], target, 1e-4f);
+
+	// AND: switching off again still drops immediately (no slope on the way down)
+	_position_control.setForwardThrust(false, math::radians(-15.f), 1.f, 1.f, 0.05f);
+	EXPECT_TRUE(runController());
+	EXPECT_EQ(_attitude.thrust_body[0], 0.f);
+}

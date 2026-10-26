@@ -557,7 +557,8 @@ void MulticopterPositionControl::Run()
 						  && _assist_enabled_by_mission,
 						  math::radians(_param_mym_pitch_min.get()),
 						  fwd_thrust_sc,
-						  _param_mym_fwd_thr_max.get());
+						  _param_mym_fwd_thr_max.get(),
+						  _param_mym_fwd_thr_slew.get());
 
 			const float speed_up = _takeoff.updateRamp(dt,
 					       PX4_ISFINITE(_vehicle_constraints.speed_up) ? _vehicle_constraints.speed_up : _param_mpc_z_vel_max_up.get());
