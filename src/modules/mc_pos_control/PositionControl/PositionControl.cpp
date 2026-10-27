@@ -220,17 +220,14 @@ void PositionControl::_accelerationControl(const float dt)
 
 	Vector3f body_z = Vector3f(-_acc_sp(0), -_acc_sp(1), -z_specific_force).normalized();
 
-	// --- 前推力辅助 ---
-	// body_z 是机体系 z 轴在本地系里的方向（水平时它指向下方），所以"低头"的需求表现为
-	// body_z(0) < 0。需求俯仰比上限更陡时，就把姿态钉在上限，把缺掉的那部分水平力
-	// 交给前向推力桨。
+	// --- 前推力辅助：把低头角钉在上限 ---
+	// body_z 是机体系 z 轴在本地系里的方向（水平时指向下方），所以"低头"的需求表现为
+	// body_z(0) < 0。需求俯仰比上限更陡时，把姿态钉在上限，缺掉的那部分水平力交给前向推力桨。
 	//
-	// 倾斜多旋翼的水平力是 (竖直力) * tan(俯仰)，所以缺额要用 tan 的差，不能照抄
-	// VtolType::pusher_assist() 里的 sin 差 —— 在我们关心的工况上 sin 版会低估约 18%
-	// （需求 24° / 上限 15°：tan 给 7.30 N，sin 只给 6.05 N）。
+	// 这一段只负责"要不要钉、钉在哪"。补多少推力在函数末尾算（_thr_sp 出来之后），
+	// 因为缺口要拿夹过之后真正形成的 _thr_sp 去反推。
 	//
-	// 这里要先留一份**没被 MPC_TILTMAX_AIR 截断**的方向：缺额必须按"真正要求了多少"
-	// 来算，不能按截断后的角度算。
+	// 先留一份**没被 limitTilt 截断**的方向：要不要钉必须按"真正要求了多少"来算。
 	const Vector3f body_z_raw = body_z;
 
 	ControlMath::limitTilt(body_z, Vector3f(0, 0, 1), _lim_tilt);
@@ -242,12 +239,16 @@ void PositionControl::_accelerationControl(const float dt)
 	// 这样辅助**永远不可能放宽** MPC_TILTMAX_AIR 已经施加的限制。
 	const float pitch_ceiling = math::max(_pitch_min, -_lim_tilt);
 
-	if (_fwd_thrust_en && (pitch_ceiling < 0.f) && (body_z_raw.norm_squared() > FLT_EPSILON)) {
-		// _yaw_sp 要等 _velocityControl() 返回后才做合法性检查，这里先退回状态估计的航向。
-		const float yaw_ref = PX4_ISFINITE(_yaw_sp) ? _yaw_sp : _yaw;
-		const float cy = cosf(yaw_ref);
-		const float sy = sinf(yaw_ref);
+	// _yaw_sp 要等 update() 里才做合法性检查，这里先退回状态估计的航向。
+	// 航向在"判断要不要钉"和"把比力投到机头"两处都要用，提到两个分支外面算。
+	const float yaw_ref = PX4_ISFINITE(_yaw_sp) ? _yaw_sp : _yaw;
+	const float cy = cosf(yaw_ref);
+	const float sy = sinf(yaw_ref);
 
+	// 俯仰这一拍被钉在上限 = 辅助在工作。
+	bool assist_active = false;
+
+	if (_fwd_thrust_en && (pitch_ceiling < 0.f) && (body_z_raw.norm_squared() > FLT_EPSILON)) {
 		// 转到航向坐标系：x 分量就是沿机头方向（俯仰）的那一部分
 		const float x_h = cy * body_z_raw(0) + sy * body_z_raw(1);   // 沿机头
 		const float z_h = body_z_raw(2);                             // 向下
@@ -255,21 +256,7 @@ void PositionControl::_accelerationControl(const float dt)
 		const float pitch = atan2f(x_h, z_h);                        // 负 = 低头
 
 		if (pitch < pitch_ceiling) {
-			// 缺掉的水平力 = |tan(需求角)| - |tan(上限角)|。
-			// 两个角都是负数，取负号换成绝对值来算。
-			const float deficit = tanf(-pitch) - tanf(-pitch_ceiling);
-			const float thrust_target = math::constrain(deficit * _fwd_thrust_sc, 0.f, _fwd_thrust_max);
-
-			// 上升斜坡：推进电机一步到位会有冲击 —— 实测推力桨从 0 跳到 50% 油门
-			// 的那一拍，航向漂了 32°，加速度振动指标从 5 涨到 12~14。
-			// **只限制上升**：辅助一关、或者需求消失，输出必须立刻归零，
-			// 不然"关掉辅助"之后电机还会按斜坡推好几秒。目标中途变小也立刻跟随。
-			if (_fwd_thrust_slew > FLT_EPSILON) {
-				_fwd_thrust = math::min(thrust_target, _fwd_thrust_prev + _fwd_thrust_slew * dt);
-
-			} else {
-				_fwd_thrust = thrust_target;
-			}
+			assist_active = true;
 
 			// 把俯仰钉在上限、保留滚转和航向，重建 body_z。在航向坐标系里机体 z 轴是
 			// (sin(pitch)*cos(roll), -sin(roll), cos(pitch)*cos(roll))，单位长度。
@@ -290,36 +277,8 @@ void PositionControl::_accelerationControl(const float dt)
 			// 兜底：滚转叠加一个浅俯仰仍可能超过总的倾角上限
 			// （比如 MYM_PITCH_MIN 比 MPC_TILTMAX_AIR 更宽松），所以再夹一次。
 			ControlMath::limitTilt(body_z, Vector3f(0, 0, 1), _lim_tilt);
-
-			// 前向推力桨贡献的水平加速度。下面的 _thr_sp 只包含**倾角**那一份，不加这一项的话
-			// _velocityControl() 里的抗积分饱和会看到一个根本不存在的缺额，把速度积分器冻住：
-			// 实测 15 m/s 的给定卡在 13.6 m/s，对着一个虚构的 1.26 m/s^2 缺口。
-			//
-			// thrust_body[0] 通过 K_F 和 SC = m*g/K_F 映射到机体系 x 方向的力，所以 g/SC 就是
-			// 每单位 thrust_body[0] 对应的机体系 x 加速度 —— 不需要另外标定。
-			//
-			// **不要乘倾角投影。** a_body_x 按构造就等于这个辅助要补的缺额
-			// （_fwd_thrust = (tan(需求角) - tan(上限角)) * SC，于是
-			//   a_body_x = a_需求 - a_倾角），
-			// 只要推力桨没被限幅，acc_sp_xy_produced 就正好等于 a_需求 —— 这才是
-			// "没饱和"的正确表述。乘 cos(pitch) 反而会少算：推力桨的推力轴装在机体系 x 上方
-			// 约 20°，15° 俯仰时它们真正的水平份额是
-			// cos(pitch) + (AZ/AX)*sin(pitch) = 1.06，不是 0.966；
-			// 那个虚构的缺口留下过 0.07 m/s 的稳态残差（仿真里 14.93 m/s 对 15 m/s 的给定）。
-			//
-			// 一旦辅助被 MYM_FWD_THR_MAX 限住，a_body_x 就不再增长，acc_sp_xy_produced 会掉到
-			// a_需求以下，抗积分饱和该介入的时刻它就介入了。推力轴那 0.342 的竖直分量
-			// 留给 z 通道的积分器处理。
-			if (_fwd_thrust_sc > FLT_EPSILON) {
-				const float a_body_x = _fwd_thrust * CONSTANTS_ONE_G / _fwd_thrust_sc;
-				_fwd_acc_xy = Vector2f(cy, sy) * a_body_x;
-			}
 		}
 	}
-
-	// 斜坡的起点存给下一拍。辅助没跑（关闭 / 无可算的缺额）时这里是 0，
-	// 所以每次重新投入都从 0 爬起来，不会残留上一次的推力。
-	_fwd_thrust_prev = _fwd_thrust;
 
 	// Convert to thrust assuming hover thrust produces standard gravity
 	const float thrust_ned_z = _acc_sp(2) * (_hover_thrust / CONSTANTS_ONE_G) - _hover_thrust;
@@ -327,6 +286,57 @@ void PositionControl::_accelerationControl(const float dt)
 	const float cos_ned_body = (Vector3f(0, 0, 1).dot(body_z));
 	const float collective_thrust = math::min(thrust_ned_z / cos_ned_body, -_lim_thr_min);
 	_thr_sp = body_z * collective_thrust;
+
+	// --- 推力桨补多少：把期望三轴比力投到机体坐标系，取 b_x 分量 ---
+	//   f        = (a_x, a_y, a_z - g)                期望三轴力（NED 比力，m/s^2）
+	//   f_b      = R^T f                              R 由钉过的 body_z + 给定航向定
+	//   f_b(0)   = cos(pitch)*f_x - sin(pitch)*f_z    （航向系里 b_x = (cos, 0, -sin)）
+	//
+	// 原来看起来"不需要投影"，只是因为 b_z 本来就是从 f 定出来的，f_b 退化成 (0,0,-|f|)，
+	// x 分量恒为 0；姿态一旦被上限截住，b_x 分量就不再是 0 —— **它本身就是缺额**，
+	// 不需要另外定义缺口，也不需要 tan 那一层换算。
+	//
+	// 竖直方向仍用上面的原公式：它让**竖直分量**精确等于需求。推力桨轴还有 0.342 的
+	// 竖直分量，所以总力会偏大约 2%、几乎全在 +z（轻微上飘，竖直积分器会压回来）。
+	// 要让总力精确就得把 f_b(2) 也用上，那需要 CA_ROTORn_AZ/AX 这套旋翼几何 —— 先不做。
+	if (assist_active && (_fwd_thrust_sc > FLT_EPSILON)) {
+		const float f_h_x = cy * _acc_sp(0) + sy * _acc_sp(1);   // 航向系水平分量
+		const float f_h_z = _acc_sp(2) - CONSTANTS_ONE_G;        // 竖直分量（向下为正）
+		const float body_pitch = atan2f(cy * body_z(0) + sy * body_z(1), body_z(2));
+		const float f_b0 = cosf(body_pitch) * f_h_x - sinf(body_pitch) * f_h_z;
+
+		const float thrust_target = math::constrain(f_b0 * _fwd_thrust_sc / CONSTANTS_ONE_G, 0.f, _fwd_thrust_max);
+
+		// 上升斜坡：推进电机一步到位会有冲击 —— 实测推力桨从 0 跳到 50% 油门
+		// 的那一拍，航向漂了 32°，加速度振动指标从 5 涨到 12~14。
+		// **只限制上升**：辅助一关、或者需求消失，输出必须立刻归零，
+		// 不然"关掉辅助"之后电机还会按斜坡推好几秒。目标中途变小也立刻跟随。
+		if (_fwd_thrust_slew > FLT_EPSILON) {
+			_fwd_thrust = math::min(thrust_target, _fwd_thrust_prev + _fwd_thrust_slew * dt);
+
+		} else {
+			_fwd_thrust = thrust_target;
+		}
+
+		// 抗积分饱和比的是 _acc_sp.xy()，那是**世界水平**的量；f_b0 是机体系 x 方向的量，
+		// 两者差推力桨轴 20° 上仰带来的 1/K_h（K_h = cos + (AZ/AX)*sin ~= 1.06）。
+		// produced 偏低比力偏低更危险：ARW 就是拦着积分器去修缺口的那一环，模型一旦偏低，
+		// 缺口就再也修不掉，只能变成稳态速度偏差；而力偏几个点会被积分器自己修掉。
+		// 所以这里报世界水平的缺额，按斜坡/限幅后的交付比例折算。
+		//
+		// 不报这一项的话，抗积分饱和会看到一个根本不存在的缺额，把速度积分器冻住：
+		// 实测 15 m/s 的给定卡在 13.6 m/s，对着一个虚构的 1.26 m/s^2 缺口。
+		const Vector2f a_xy_tilt = Vector2f(_thr_sp) * (CONSTANTS_ONE_G / _hover_thrust);
+		const float a_res_h = (Vector2f(_acc_sp) - a_xy_tilt).dot(Vector2f(cy, sy));
+
+		if (thrust_target > FLT_EPSILON) {
+			_fwd_acc_xy = Vector2f(cy, sy) * (a_res_h * (_fwd_thrust / thrust_target));
+		}
+	}
+
+	// 斜坡的起点存给下一拍。辅助没跑（关闭 / 没到上限）时这里是 0，
+	// 所以每次重新投入都从 0 爬起来，不会残留上一次的推力。
+	_fwd_thrust_prev = _fwd_thrust;
 }
 
 bool PositionControl::_inputValid()
@@ -376,10 +386,10 @@ void PositionControl::getAttitudeSetpoint(vehicle_attitude_setpoint_s &attitude_
 	ControlMath::thrustToAttitude(_thr_sp, _yaw_sp, attitude_setpoint);
 	attitude_setpoint.yaw_sp_move_rate = _yawspeed_sp;
 
-	// 前向推力桨的推力，数值在 _accelerationControl() 里算好。
+	// 前向推力桨的 x 分量，数值在 _accelerationControl() 里算好。
 	// thrust_body 由分配器**逐轴归一化**（ControlAllocationPseudoInverse 会把每个推力轴除以
-	// 它对应伪逆列的平均模长），所以这里的 1.0 不是 1 N，而是"产生机体系 x 向力的那些执行器
-	// 满量程"。thrustToAttitude() 只写 thrust_body[2]，结构体又是零初始化，所以
-	// _fwd_thrust == 0（辅助关闭）时输出和加这个功能之前**逐字节一致**。
+	// 它对应列的平均模长），所以这里的 1.0 不是 1 N，而是"产生机体系 x 向力的那些执行器满量程"。
+	// thrustToAttitude() 只写 thrust_body[2]，结构体又是零初始化，所以
+	// _fwd_thrust == 0（辅助关闭）时输出和原版**逐字节一致**。
 	attitude_setpoint.thrust_body[0] = _fwd_thrust;
 }

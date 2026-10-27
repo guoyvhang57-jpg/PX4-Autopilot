@@ -422,6 +422,8 @@ TEST_F(PositionControlBasicTest, IntegratorWindupWithInvalidSetpoint)
 	EXPECT_FLOAT_EQ(euler_att.theta(), 0.f);
 }
 
+
+
 TEST_F(PositionControlBasicTest, ForwardThrustRamp)
 {
 	// GIVEN: a demand of 5 m/s^2 forward, which is ~27 deg of pitch and therefore
@@ -431,11 +433,13 @@ TEST_F(PositionControlBasicTest, ForwardThrustRamp)
 	_input_setpoint.acceleration[2] = 0.f;
 	_position_control.setForwardThrust(true, math::radians(-15.f), 1.f, 1.f, 0.f);
 
-	// WHEN: the assist is not sloped, THEN the output goes straight to the target
+	// WHEN: the assist is not sloped, THEN the output goes straight to the target.
+	// The target is the body-x component of the desired specific force:
+	// b_x . (5, 0, -g) / g = 0.234 at 15 deg nose-down.
 	EXPECT_TRUE(runController());
 	const float target = _attitude.thrust_body[0];
 	EXPECT_GT(target, 0.2f);
-	EXPECT_LT(target, 0.25f);   // tan(27deg) - tan(15deg) = 0.24
+	EXPECT_LT(target, 0.25f);
 
 	// WHEN: the assist is switched off, THEN the output drops immediately
 	_position_control.setForwardThrust(false, math::radians(-15.f), 1.f, 1.f, 0.f);
@@ -463,4 +467,38 @@ TEST_F(PositionControlBasicTest, ForwardThrustRamp)
 	_position_control.setForwardThrust(false, math::radians(-15.f), 1.f, 1.f, 0.05f);
 	EXPECT_TRUE(runController());
 	EXPECT_EQ(_attitude.thrust_body[0], 0.f);
+}
+
+TEST_F(PositionControlBasicTest, ForwardThrustAccountsForVerticalAcceleration)
+{
+	// The assist gets the body-x component of the desired specific force f = (a_x, a_y, a_z - g),
+	// so the vertical acceleration moves the answer even though the attitude is clamped either way.
+	_input_setpoint.acceleration[0] = 5.f;
+	_input_setpoint.acceleration[1] = 0.f;
+	_position_control.setForwardThrust(true, math::radians(-15.f), 1.f, 1.f, 0.f);
+
+	// GIVEN: level flight
+	_input_setpoint.acceleration[2] = 0.f;
+	EXPECT_TRUE(runController());
+	const float level = _attitude.thrust_body[0];
+	EXPECT_NEAR(level, 0.2337f, 1e-3f);
+
+	// GIVEN: descending 3 m/s^2, THEN the capped tilt delivers less and the assist compensates
+	_input_setpoint.acceleration[2] = 3.f;
+	EXPECT_TRUE(runController());
+	const float descending = _attitude.thrust_body[0];
+	EXPECT_NEAR(descending, 0.3128f, 1e-3f);
+	EXPECT_GT(descending, level);
+
+	// GIVEN: climbing 3 m/s^2, THEN the tilt delivers more and the assist backs off
+	_input_setpoint.acceleration[2] = -3.f;
+	EXPECT_TRUE(runController());
+	const float climbing = _attitude.thrust_body[0];
+	EXPECT_NEAR(climbing, 0.1545f, 1e-3f);
+	EXPECT_LT(climbing, level);
+
+	// AND: going back to level restores the level value (no state carried over)
+	_input_setpoint.acceleration[2] = 0.f;
+	EXPECT_TRUE(runController());
+	EXPECT_NEAR(_attitude.thrust_body[0], level, 1e-4f);
 }

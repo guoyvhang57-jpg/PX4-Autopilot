@@ -142,23 +142,29 @@ parameters:
       default: 0
     MYM_FWD_THR_SC:
       description:
-        short: 缺失水平力到前推力的换算系数
+        short: 产生 1 g 机体系 x 加速度所需的归一化前推力
         long: |-
-          把缺失的水平力 [N] 换算成写进 thrust_body[0] 的归一化前推力。
+          归一化前推力的刻度：`thrust_body[0] = SC` 时，机体系 x 加速度正好是 1 g，
+          和 z 轴上的 MPC_THR_HOVER 完全同构（`thrust_body[2] = HOVER` ⇒ 竖直 1 g）。
+          所以它**不是**"缺额 [N] 到归一化油门"的换算，整个换算里没有牛顿。
+
           这是**几何换算，不是调参增益**：
 
               SC = m*g / K_F
 
-          K_F 是一个单位的 thrust_body[0] 能产生的前向力 [N]，由分配器几何决定。
+          K_F 是 thrust_body[0] = 1 时机体系 x 方向的力，由分配器几何决定。
 
           **填 0 = 自动算（推荐）**：my_mission 会从机体的物理量推出来，通过
           my_mission_assist.fwd_thrust_sc 每拍发过来：
 
-              SC = MPC_THR_HOVER * (4 + 2*|CA_ROTOR4_AZ|) / CA_ROTOR4_AX
+              SC = HOVER * N_lift * (1 + |CA_ROTOR4_AZ|) / (N_act * CA_ROTOR4_AX)
+                 = HOVER * 0.9515            （4 升力桨 + 2 推力桨，AX=0.94，AZ=0.342）
 
-          这样改 CA_ROTOR*_CT 或 MPC_THR_HOVER 时它会自动跟上，不会出现
-          "三个地方各填一个数、互相矛盾"的情况（曾经出现过 CT=21.6、
-          MPC_THR_HOVER=0.41、SC=0.44 三者互不一致）。
+          分母里的 N_act（执行器总数）来自分配器的逐轴归一化，见
+          ControlAllocationPseudoInverse.cpp:126-147。
+
+          它随 MPC_THR_HOVER 线性变化：hover 0.30 → SC 0.285，hover 0.46 → 0.438。
+          **不要跨平台抄这个数**（SITL 和实机的悬停油门通常不同）。
 
           填正数则直接用（不跑 my_mission 时也用这个值）。
       type: float
