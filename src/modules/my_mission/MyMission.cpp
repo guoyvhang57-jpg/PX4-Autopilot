@@ -187,20 +187,30 @@ void MyMission::refreshConfig()
 
 	// ---- 缺额换算系数：填 0 就自动算 ----
 	//
-	// SC = m*g / K_F，其中
-	//   K_F   = 分配器对推力轴 x 的归一化基准 = CA_ROTOR4_CT * CA_ROTOR4_AX
-	//           （推力桨的 CT 和 AX 相乘，CT 在分子分母里抵消掉，所以这里不出现）
-	//   m*g   = MPC_THR_HOVER × 全部旋翼的竖直满推能力
-	//         = MPC_THR_HOVER × (4*CT_lift + 2*CT_thruster*|AZ|)
+	// SC 的定义只有一句：**产生 1 g 机体系 x 加速度所需的归一化前推力**，
+	// 和 MPC_THR_HOVER 在 z 轴上完全同构（`thrust_body[0] = SC` ⇒ x 加速度 1 g）。
 	//
-	// 两个 CT 都当场消掉，最后只剩机体几何和悬停占比：
+	//   SC = m*g / K_F
 	//
-	//   SC = MPC_THR_HOVER * (N_lift + N_thr*|AZ_thr|) / AX_thr
-	//      = MPC_THR_HOVER * (4 + 2*0.342) / 0.94
-	//      = MPC_THR_HOVER * 4.98
+	//   m*g = N_lift * hover * CT               悬停时升力桨承担机重
+	//   K_F = N_act * AX / (1 + |AZ|) * CT      分配器对 x 轴的归一化增益
 	//
-	// 这样改 CT / MPC_THR_HOVER 时 SC 自动跟着变，不会再出现"三处各填一个数、
-	// 互相矛盾"的情况（上一版就是 CT=21.6、MPC_THR_HOVER=0.41、SC=0.44，三个都不一致）。
+	// CT 在分子分母里抵消，最后只剩机体几何和悬停占比：
+	//
+	//   SC = hover * N_lift * (1 + |AZ|) / (N_act * AX)
+	//      = hover * 4 * 1.342 / (6 * 0.94)
+	//      = hover * 0.9515
+	//
+	// 分母里那个 N_act（执行器总数）来自分配器的**逐轴归一化**
+	// （ControlAllocationPseudoInverse.cpp:126-147：把伪逆的每一列除以该列的平均模长）。
+	// 所以 1.0 不是"一台桨满油门"，而是"参与这一轴的执行器平均满油门"：
+	// 只有两台推力桨出力却要摊 6 个执行器的平均，于是被放大 3 倍；升力桨还要减掉
+	// 推力桨 AZ 那 0.342 的竖直分量（各 −0.382/单位），列的平均模长变大，放大倍数降到 2.24。
+	//
+	// 旧的 (N_lift + N_thr*|AZ|)/AX 把 K_F 当成"一台推力桨的 AX × CT"，既漏了第二台，
+	// 也漏了这层归一化，结果大 5.2 倍（实机 hover=0.30 时给 1.50 而不是 0.285），
+	// 辅助一开就顶到执行器饱和。
+	//
 	// 填一个正数则直接用（兼容旧配置，也方便临时试验）。
 	const float sc_param = _param_myr_fwd_thr_sc.get();
 
@@ -210,10 +220,10 @@ void MyMission::refreshConfig()
 	} else {
 		const float ax = math::max(fabsf(_external.caThrusterAx()), 0.05f);
 		const float az = fabsf(_external.caThrusterAz());
-		// 4 个升力桨 + 2 个推力桨，推力桨竖直分量只有 |AZ| 那么多
 		static constexpr float kNlift = 4.f;
 		static constexpr float kNthr = 2.f;
-		_config.fwd_thr_sc = _external.mpcThrHover() * (kNlift + kNthr * az) / ax;
+		static constexpr float kNact = kNlift + kNthr;
+		_config.fwd_thr_sc = _external.mpcThrHover() * kNlift * (1.f + az) / (kNact * ax);
 	}
 }
 
