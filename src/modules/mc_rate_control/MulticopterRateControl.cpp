@@ -253,22 +253,28 @@ MulticopterRateControl::Run()
 					// trim 是等幅反相的，取均值就是没加 trim 时的工作点。
 					const float u_mean = 0.5f * (motors.control[act1] + motors.control[act2]);
 
-					// 换算系数不是常数。开了 THR_MDL_FAC 之后执行器指令是**归一化转速**，
-					// 推力按 u^2 走，所以"每单位差动换来多少偏航力矩"是这个东西的导数：
+					// 换算系数是**常数**，与油门无关。actuator_motors 的指令是归一化推力，
+					// 推力对它线性（THR_MDL_FAC 那条曲线在下游 mixer_module 才把推力开方成
+					// 电机信号），所以"每单位差动换来多少偏航力矩"不随油门变化。
 					//
-					//   d(tau)/d(diff) = 4 * PY * AX * CT * u_mean
+					// 输入输出两边都是归一化量，所以这个系数无量纲：
 					//
-					// 在本机型上就是 44.7 * u_mean：19% 油门时 8.5 N·m/单位，50% 时 22.3，
-					// 100% 时 44.7。MC_YAW_DIFF_GAIN 是按 u_mean = 0.5 定义的，所以要乘 0.5/u_mean。
+					//   系数 = 偏航轴满量程力矩 / 差动满量程力矩
+					//        = (1/scale_yaw) / (2 * PY * AX * CT)
 					//
-					// 这一项算错的后果一点也不微妙：19% 油门用固定增益时，实际只交出去它减掉的
-					// 38% 的力矩，偏航积分于是涨了 2.6 倍去补这个洞（实测 0.046 -> 0.111 还在涨，
-					// 预测值 0.121）。分母那个下限是为了推力桨关掉时除法不发散 —— 那时余量本来就是 0，
-					// 什么都不会交出去。
-					const float gain_eff = yaw_diff_gain / math::max(2.f * u_mean, 0.02f);
+					// 分子来自分配器（scale_yaw 是伪逆偏航列的最大项），分母来自两台推力桨
+					// 的真实几何。本机型两者相除是 0.248。
+					//
+					// 油门只进入**限幅**：这一对桨工作点在 u_mean，能往两边各走
+					// min(u_mean, 1-u_mean)，所以最多交得出去的力矩是余量除以系数。
+					//
+					// 早先按"指令是转速、推力 ∝ u²"建了个 4*PY*AX*CT*u_mean 的模型，于是把
+					// 系数写成了 gain/(2*u_mean)。那个模型是错的：同一套参数在 19% 和 50%
+					// 油门之间会差 3 倍 —— 低油门交少了、高油门交多了，两边都不对。
+					const float diff_per_torque = yaw_diff_gain;
 
 					const float headroom = math::max(0.f, math::min(u_mean, 1.f - u_mean));
-					const float max_torque = headroom / gain_eff;
+					const float max_torque = headroom / diff_per_torque;
 
 					// 交给这一对桨的份额，按它当前油门的比例算。**这是"不用 slew limiter
 					// 也能双向平滑交接"的关键**：推力桨转速爬升，份额跟着爬升；它们降下来，
@@ -289,7 +295,7 @@ MulticopterRateControl::Run()
 					// 真正交给这一对桨的力矩：先夹到它交付得出的范围内，再乘油门份额。
 					const float yaw_torque = math::constrain(rate_ctrl_status.yawspeed_integ,
 								 -max_torque, max_torque) * share;
-					const float diff = yaw_torque * gain_eff;
+					const float diff = yaw_torque * diff_per_torque;
 
 					torque_setpoint(2) -= yaw_torque;
 

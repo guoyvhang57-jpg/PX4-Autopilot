@@ -250,39 +250,33 @@ parameters:
           pair has no headroom (thrusters off or saturated) everything stays on the lift rotors, and
           the transition is continuous with throttle rather than a switch.
 
-          The value is a unit conversion, not a tuning gain, but it is defined at 50% throttle:
+          A unit conversion, not a tuning gain, and **constant with throttle** -- both sides are
+          normalised, so it is dimensionless:
 
-            gain = 1 / (2 * PY * AX * CT)
+            gain = (1 / scale_yaw) / (2 * PY * AX * CT)
 
-          with PY the REAL lever arm, AX the thrust-axis body-x component and CT the rotor thrust
-          coefficient. For a 0.55 m lever arm and 20 deg of thrust-axis tilt with CT = 21.6 N,
-          2 * 0.55 * 0.940 * 21.6 = 22.3 N*m per unit, so gain = 0.045.
+          scale_yaw is the allocator's yaw normalisation (the largest entry of the pseudo-inverse's
+          yaw column), PY the REAL lever arm, AX the thrust-axis body-x component and CT the rotor
+          thrust coefficient. For this airframe:
 
-          The 50% is not arbitrary and the conversion is not constant. With THR_MDL_FAC the actuator
-          command is a normalised rotor speed, so thrust goes as u^2 and the yaw torque per unit of
-          differential is its derivative, 4 * PY * AX * CT * u: 8.5 N*m/unit at 19% throttle, 22.3 at
-          50%, 44.7 at 100%. The implementation scales this gain by 0.5/u_mean, so the value to enter
-          here is always the 50% figure and the throttle dependence is handled for you.
+            10.26 N*m / (2 * 0.55 m * 0.94 * 40 N) = 0.248
 
-          Getting that wrong is not subtle: a constant gain flown at 19% throttle delivered only 38%
-          of the torque it removed and the yaw integrator grew 2.6x to cover the hole.
+          Throttle does not enter the gain, only the limit: the pair sits at u_mean and can move
+          min(u_mean, 1-u_mean) either way, so the torque handed over is clamped to that headroom
+          divided by the gain.
 
-          PY in that formula is the real geometry, NOT CA_ROTORn_PY. CA_ROTORn_PY must stay 0, and
-          that is the whole reason this path exists: telling the allocator about the lever arm would
-          make it take the yaw channel over (the pair is ~20x more yaw-effective than the lift
-          rotors) and smear the slipstream, so instead the allocator is kept blind and the steady
-          part of the yaw demand comes through the motor trim, which bypasses the allocation and
-          therefore only depends on the real geometry.
+          PY is the real geometry, NOT CA_ROTORn_PY. That parameter must stay 0, and it is the whole
+          reason this path exists: telling the allocator about the lever arm would let it take the
+          yaw channel over (the pair is several times more yaw-effective per unit command than a
+          lift rotor) and smear the slipstream, so instead the allocator is kept blind and the yaw
+          demand comes through the motor trim, which bypasses the allocation.
 
           Consequence: this gain is the only place the real lever arm is written down. Changing the
-          airframe geometry means recomputing it, and CA_ROTORn_PY is not going to remind you.
+          geometry, the number of lift rotors or their thrust-axis tilt changes scale_yaw and the
+          gain; CA_ROTORn_PY is not going to remind you.
 
           Do not set CA_ROTORn_PY non-zero while this is enabled. The allocator and this path would
           then both drive the differential and the yaw loop gain would be wrong.
-
-          The formula also assumes CA_ROTORn_CT is in newtons, i.e. that one unit of normalised yaw
-          torque is one N*m. If the airframe uses normalised CT values instead, the allocator's yaw
-          scale changes and this gain has to be divided by it.
       type: float
       default: 0.0
       min: 0.0
