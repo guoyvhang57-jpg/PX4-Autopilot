@@ -27,17 +27,36 @@ param set-default CA_ROTOR_COUNT 6
 # --- 升力旋翼 ---
 # 注：升力桨在 z=0.35187，比重心(0.31003)高 0.04184 m，但这里故意不设 PZ ——
 #     竖直桨的 position x (0,0,-1) 不含 z 分量，PZ 对力矩严格无影响。
+#
+# 5° 转子倾斜（和实机一致）：每台桨的推力轴不是竖直的，而是沿机臂的**切向**偏 5°，
+# 于是推力的横向分量也产生偏航力臂 —— 升力桨每单位的偏航力矩从 CT·KM = 1.0 N·m
+# 抬到 2.564 N·m（2.56 倍）。这就是 MC_YAW_DIFF_GAIN 在实机上要 0.248、而竖直桨
+# 只要 0.101 的原因（0.248 是偏航轴满量程 / 差动满量程，满量程锚在升力桨上）。
+# SDF 里对应每个 rotor link 的 pose 加了 roll/pitch，值的推导：
+#   FLU 推力方向 = (AX, -AY, 0.9962)，roll = asin(-uy)，pitch = asin(ux/cos(roll))
 param set-default CA_ROTOR0_PX  0.29898    # 右前 ccw
 param set-default CA_ROTOR0_PY  0.33634
+param set-default CA_ROTOR0_AX -0.0651
+param set-default CA_ROTOR0_AY  0.0579
+param set-default CA_ROTOR0_AZ -0.9962
 param set-default CA_ROTOR0_KM  0.025
 param set-default CA_ROTOR1_PX -0.29898    # 左后 ccw
 param set-default CA_ROTOR1_PY -0.33634
+param set-default CA_ROTOR1_AX  0.0651
+param set-default CA_ROTOR1_AY -0.0579
+param set-default CA_ROTOR1_AZ -0.9962
 param set-default CA_ROTOR1_KM  0.025
 param set-default CA_ROTOR2_PX  0.29898    # 左前 cw
 param set-default CA_ROTOR2_PY -0.33634
+param set-default CA_ROTOR2_AX -0.0651
+param set-default CA_ROTOR2_AY -0.0579
+param set-default CA_ROTOR2_AZ -0.9962
 param set-default CA_ROTOR2_KM -0.025
 param set-default CA_ROTOR3_PX -0.29898    # 右后 cw
 param set-default CA_ROTOR3_PY  0.33634
+param set-default CA_ROTOR3_AX  0.0651
+param set-default CA_ROTOR3_AY  0.0579
+param set-default CA_ROTOR3_AZ -0.9962
 param set-default CA_ROTOR3_KM -0.025
 
 # --- 推力电机 ---
@@ -52,28 +71,40 @@ param set-default CA_ROTOR3_KM -0.025
 #               2 x 0.29898 x 21.6 = 12.9 N·m —— 等于吃掉 89%，剩不下控制余量。
 # PY = 0      ：故意不告诉它力臂 —— 否则分配器会优先用它们做偏航（力臂 0.517 vs
 #               升力桨 KM 0.025），造成持续差动、白耗功率，并在机翼上产生非指令滑流。
-#               以后若要用差动偏航，把 PY 改成 ±0.55
+#               SDF 里两台在 y = ∓0.55（即间距 1.1 m），这里刻意不填。
+#               偏航 I 项由 MC_YAW_DIFF_GAIN 那条旁路注入（见 mc_rate_control）。
+# KM = ±0.025 ：两台对转，同转速时反扭矩抵消、差动时才显现。填上让矩阵诚实：
+#               差动 δ 的偏航力矩里除了 PY 力臂那 0.517 项，还有这 0.025 的反扭矩项，
+#               虽然只占 1.7%，但漏掉它等于承认"这台飞机上螺旋桨没有反扭矩"。
+#               注意：填了也不会让分配器开始用它们做偏航 —— 伪逆是最小范数解，
+#               升力桨的偏航效率（每单位 2.564 N·m）是推力桨（0.342 N·m）的 7.5 倍。
 param set-default CA_ROTOR4_PX  0
 param set-default CA_ROTOR4_PY  0
 param set-default CA_ROTOR4_PZ  0
 param set-default CA_ROTOR4_AX  0.940
 param set-default CA_ROTOR4_AY  0
 param set-default CA_ROTOR4_AZ -0.342
-param set-default CA_ROTOR4_KM  0
+param set-default CA_ROTOR4_KM  0.025
 param set-default CA_ROTOR5_PX  0
 param set-default CA_ROTOR5_PY  0
 param set-default CA_ROTOR5_PZ  0
 param set-default CA_ROTOR5_AX  0.940
 param set-default CA_ROTOR5_AY  0
 param set-default CA_ROTOR5_AZ -0.342
-param set-default CA_ROTOR5_KM  0
+param set-default CA_ROTOR5_KM -0.025
 
 # ---------------------------------------------------------------------------
 # thrust_body 是**无量纲**的，不是牛顿：ControlAllocationPseudoInverse.cpp 会把每个
 # 推力轴按 norm_sum/num_non_zero 归一化成"该方向作动器的平均值，1 = 满量程"。
-# 实测悬停 thrust_body[2]=-0.46 正好解出四个升力桨各 0.46，与 MPC_THR_HOVER 一致。
-# 六个桨 CT 同值时，伪逆的 1/k 和归一化的 1/k 互相抵消 —— CT=21.6 与 CT=1 完全等价，
-# CT 只在各桨取值不同时才改变分配权重。
+# 悬停 thrust_body[2]=-MPC_THR_HOVER 正好解出四个升力桨各 0.25。
+# 六个桨 CT 同值时，伪逆的 1/k 和归一化的 1/k 互相抵消 —— CT 的绝对值不影响
+# 归一化后的分配权重，只决定"1 = 多少牛顿"（K_x、K_z、SC 都随 CT 线性变）。
+#
+# CT 取 40 N 是为了和实机对齐（实机 CA_ROTORn_CT = 40）。改 CT 必须同步三处：
+#   model.sdf 的 motorConstant = CT / maxRotVelocity² = 40 / 520² = 1.48e-04
+#   MPC_THR_HOVER 反向缩放    ：0.46 × 21.6/40 = 0.25（悬停推力占满量程的比例）
+#   MYM_FWD_THR_SC 不用动      ：SC = 0.9515 × hover，hover 已经是新值，自动跟上
+# 校验：m·g = hover × K_z = 0.25 × (4 × 40) = 40 N → m = 4.08 kg（SDF 的惯量）
 #
 # 下面这几个参数配套，是为了让"推力指令 -> 电机指令"这一段线性：
 #   CA_ROTORn_CT   = 每桨满推推力 [N]（线性模型里的系数）
@@ -81,12 +112,12 @@ param set-default CA_ROTOR5_KM  0
 #   THR_MDL_FAC    = 1.0              （输出级把"推力指令"开方成电机指令，正好抵消
 #                                       T ∝ w^2，使分配器的线性模型精确）
 # ---------------------------------------------------------------------------
-param set-default CA_ROTOR0_CT 21.6
-param set-default CA_ROTOR1_CT 21.6
-param set-default CA_ROTOR2_CT 21.6
-param set-default CA_ROTOR3_CT 21.6
-param set-default CA_ROTOR4_CT 21.6
-param set-default CA_ROTOR5_CT 21.6
+param set-default CA_ROTOR0_CT 40
+param set-default CA_ROTOR1_CT 40
+param set-default CA_ROTOR2_CT 40
+param set-default CA_ROTOR3_CT 40
+param set-default CA_ROTOR4_CT 40
+param set-default CA_ROTOR5_CT 40
 param set-default THR_MDL_FAC 1.0
 
 # 电调映射：单位是 rad/s，必须等于对应插件的 maxRotVelocity
@@ -112,10 +143,17 @@ param set-default SIM_GZ_EC_MAX6 520
 # 该机没有空速管（只有 rc.vtol_defaults / rc.fw_defaults 会要求空速）
 param set-default SYS_HAS_NUM_ASPD 0
 
-# 悬停油门：4 个升力桨扛 4.087 kg -> 40.1 N / (4 * 21.6) = 0.46
-param set-default MPC_THR_HOVER 0.46
+# 悬停油门：4 个升力桨扛 4.087 kg -> 40.1 N / (4 * 40) = 0.25
+param set-default MPC_THR_HOVER 0.25
 param set-default MC_AIRMODE 1
 param set-default NAV_DLL_ACT 2
+
+# 偏航 I 项交给推力桨差动的换算系数（见 mc_rate_control 的参数说明）。
+#   = 偏航轴满量程力矩 / 差动满量程力矩
+#   = 10.26 N·m / (2 * 0.55 m * 0.94 * 40 N) = 0.248
+# 只在 Offboard 下生效；填 0 等于把偏航完全留给升力桨。
+# ⚠ 已经存在参数存储里的值不会被 set-default 覆盖，老仿真要手动 param set。
+param set-default MC_YAW_DIFF_GAIN 0.248
 
 # ---------------------------------------------------------------------------
 # 解锁方式：遥控器手势（不用解锁开关）
